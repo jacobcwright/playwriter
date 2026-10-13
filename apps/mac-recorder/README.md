@@ -56,6 +56,21 @@ Contents/Resources/icon.icns
 Sources live in `src/`; `dist/` is build output and git-ignored.
 `src/entitlements.plist` is only used at signing time (see below).
 
+## Install with one command (no Gatekeeper prompt, notarized or not)
+
+Browsers add the quarantine flag that makes Gatekeeper block an unnotarized
+app. `curl` does not. So this installs with no warning on any Mac:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jacobcwright/playwriter/codex/microphone-narration/apps/mac-recorder/install.sh | bash
+```
+
+It downloads the latest GitHub Release zip (`Playwriter-Recorder.zip`),
+unpacks it into /Applications (or ~/Applications), clears any quarantine flag,
+and opens the app. Set `PLAYWRITER_RECORDER_URL` to install a specific zip.
+Releases must upload the zip under the fixed name `Playwriter-Recorder.zip`
+for the `releases/latest/download/` URL to work.
+
 ## Signing and notarizing
 
 Without any configuration the build is **ad-hoc signed** (`codesign --sign -`):
