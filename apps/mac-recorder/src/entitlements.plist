@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for Contents/Resources/bin/playwriter-recorder,
+  the Bun-compiled CLI + relay. Bun's JavaScriptCore JIT needs writable+
+  executable memory, which the hardened runtime forbids without these three.
+  The launcher itself is a bash script and gets no entitlements; the
+  microphone is requested by Chrome for Testing, not by this app.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-executable-page-protection</key>
+  <true/>
+</dict>
+</plist>

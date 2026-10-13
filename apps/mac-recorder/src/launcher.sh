@@ -8,8 +8,14 @@
 #      persistent profile, on the "ready" page
 # Every failure is shown in a dialog; nothing fails silently.
 #
+# On the first launch (no $LOGINS_MARKER), once the extension is connected, it
+# offers to copy the user's logins from their everyday Chrome (import_logins
+# in common.sh).
+#
 # Flags: --install-login-item / --uninstall-login-item manage the LaunchAgent
 # that keeps the relay alive at login (see install-relay-agent.sh).
+# --import-logins runs the normal launch and then copies the Chrome logins
+# again, without asking (open -a "Playwriter Recorder" --args --import-logins).
 
 set -u
 
@@ -19,12 +25,16 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 # shellcheck source=common.sh
 . "$RESOURCES_DIR/lib/common.sh"
 
+IMPORT_LOGINS=0
 case "${1:-}" in
   --install-login-item)
     exec "$RESOURCES_DIR/install-relay-agent.sh"
     ;;
   --uninstall-login-item)
     exec "$RESOURCES_DIR/uninstall-relay-agent.sh"
+    ;;
+  --import-logins)
+    IMPORT_LOGINS=1
     ;;
 esac
 
@@ -103,8 +113,22 @@ wait_for_extension() {
   return 1
 }
 
+# 4. Logins -------------------------------------------------------------------
+# Runs only once the extension is connected: the import goes through the relay
+# into this browser. --import-logins forces it; otherwise it is offered once.
+after_extension_connected() {
+  if [ "$IMPORT_LOGINS" = 1 ]; then
+    import_logins run
+  elif [ ! -e "$LOGINS_MARKER" ]; then
+    import_logins offer
+  else
+    log "Logins already offered ($LOGINS_MARKER); delete it or use --import-logins to copy them again"
+  fi
+}
+
 if wait_for_extension 20; then
   log "Extension connected to relay"
+  after_extension_connected
 else
   # Seen once on a first run: the relay answered GETs and curl, but the
   # extension's startup probe (HEAD /) hung until the relay was restarted.
@@ -115,7 +139,9 @@ else
   start_relay_detached
   if wait_for_relay 20 && wait_for_extension 20; then
     log "Extension connected to relay after relay restart"
+    after_extension_connected
   else
+    log "Logins import skipped: the extension is not connected"
     show_error "Chrome for Testing opened, but the Playwriter extension has not connected to the relay. If the toolbar says 'Relay not connected', quit the browser and open $APP_NAME again. Logs: $LOG_FILE and $HOME/.playwriter/relay-server.log"
   fi
 fi
