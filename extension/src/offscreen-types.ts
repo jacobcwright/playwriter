@@ -31,6 +31,69 @@ export interface OffscreenStartRecordingMessage {
   videoBitsPerSecond?: number
   audioBitsPerSecond?: number
   audio?: boolean
+  /** Mix the microphone into the audio track (with tab audio when `audio` is set) */
+  microphone?: boolean
+}
+
+// ── Narration (microphone) for the skill recorder ───────────────────────────
+
+export interface OffscreenGetMicrophoneStateMessage {
+  action: 'getMicrophoneState'
+}
+
+export interface OffscreenStartNarrationMessage {
+  action: 'startNarration'
+  recordingId: string
+  audioBitsPerSecond?: number
+}
+
+export interface OffscreenStopNarrationMessage {
+  action: 'stopNarration'
+  recordingId: string
+}
+
+export interface OffscreenCancelNarrationMessage {
+  action: 'cancelNarration'
+  recordingId: string
+}
+
+export type OffscreenMicrophoneStateResult = {
+  state: 'granted' | 'denied' | 'prompt' | 'unavailable'
+  hasMicrophone?: boolean
+  error?: string
+}
+
+export type OffscreenStartNarrationResult =
+  | { success: true; recordingId: string; startedAt: number; mimeType: string; deviceLabel?: string }
+  | {
+      success: false
+      reason:
+        | 'permission-denied'
+        | 'permission-pending'
+        | 'no-microphone'
+        | 'capture-failed'
+        | 'unsupported'
+        | 'already-active'
+      error: string
+    }
+
+export type OffscreenStopNarrationResult =
+  | { success: true; recordingId: string; durationMs: number }
+  | { success: false; error: string }
+
+/** Messages FROM offscreen TO background for narration */
+export interface OffscreenNarrationChunkMessage {
+  action: 'narrationChunk'
+  recordingId: string
+  dataBase64: string
+}
+
+export interface OffscreenNarrationEndedMessage {
+  action: 'narrationEnded'
+  recordingId: string
+  reason: 'stopped' | 'cancelled' | 'device-lost' | 'error'
+  error?: string
+  durationMs?: number
 }
 
 export interface OffscreenStopRecordingMessage {
@@ -59,6 +122,10 @@ export type OffscreenMessage =
   | OffscreenIsRecordingMessage
   | OffscreenCancelRecordingMessage
   | OffscreenCopyTextMessage
+  | OffscreenGetMicrophoneStateMessage
+  | OffscreenStartNarrationMessage
+  | OffscreenStopNarrationMessage
+  | OffscreenCancelNarrationMessage
 
 // Offscreen document response types
 export type OffscreenStartRecordingResult =
@@ -115,4 +182,8 @@ export interface OffscreenRecordingCancelledMessage {
   tabId: number
 }
 
-export type OffscreenOutgoingMessage = OffscreenRecordingChunkMessage | OffscreenRecordingCancelledMessage
+export type OffscreenOutgoingMessage =
+  | OffscreenRecordingChunkMessage
+  | OffscreenRecordingCancelledMessage
+  | OffscreenNarrationChunkMessage
+  | OffscreenNarrationEndedMessage

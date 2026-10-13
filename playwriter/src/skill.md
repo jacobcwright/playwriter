@@ -334,13 +334,18 @@ The user can start recording from the **in-page toolbar** (Record) or ask you to
 ```bash
 playwriter recorder start            # reuse the only session, or create one
 playwriter recorder start -s 1       # attach to an existing session
+playwriter recorder start --mic      # also record the user's voice (microphone narration, off by default)
 playwriter recorder status           # active recordings + current page urls
 playwriter recorder stop             # stop the only active recording
 playwriter recorder stop 3           # stop recording 3 when several are active
-playwriter recorder events           # thin timeline of the latest recording
+playwriter recorder events           # thin timeline of the latest recording (narration transcript inline if present)
 playwriter recorder events -r 3      # events of recording 3
 playwriter recorder events 4 7       # full details of events 4 and 7
+playwriter recorder narration -r 3   # narration audio path + timing metadata
+playwriter recorder transcribe -r 3  # local-only transcription (whisper.cpp, openai-whisper, or --command)
 ```
+
+**Narration:** with `--mic` (or the toolbar **Mic** toggle) the user's microphone is recorded alongside the actions into `~/.playwriter/recordings/<id>/narration.webm`; `audioStartMs` in the metadata aligns it with event `ms`. Chrome asks for microphone permission once, in a visible Playwriter tab; a denied or missing microphone never cancels the recording (the timeline gets a `narration-unavailable` event). Audio is never uploaded. Transcribing is a separate local step; afterwards `recorder events` interleaves `narration` events (`text`, `ms`, `endMs`) with the actions, and the skill-authoring instructions printed by `recorder start` explain how to use the speech for step intent, conditions, and parameters.
 
 Run `playwriter recorder stop` when they say done, then `playwriter recorder events -r <id>` to read the events. If stop fails because **more than one recording is active**, the error lists each recording id, session, and current or last page URL. Pick the one that matches the workflow (or ask the user), then `playwriter recorder stop <id>`. Replay the flow with **playwriter** commands only (`playwriter -s <id> -e '...'`), never raw Playwright. The `recorder start` output prints full instructions for turning a recording into a reusable skill: a SKILL.md of markdown instructions with example playwriter commands, plus an importable helper script (`submit.js`, `sdk.js`) for cheap replay. Recording runs inside the relay daemon, so it survives CLI exits. Pass `-s <id>` to record an existing session; the recorder attaches to all Playwriter-enabled tabs and does not open a new tab. A recording auto-stops after 20 minutes.
 
@@ -1210,6 +1215,7 @@ await recording.start({
   outputPath: '/absolute/path/to/recording.mp4',
   frameRate: 30, // default
   audio: false, // default (tab audio)
+  microphone: false, // default. true = mix the user's microphone in (with tab audio when `audio` is true); needs the one-time mic permission
   videoBitsPerSecond: 2500000,
   aspectRatio: { width: 16, height: 9 }, // default, set null to skip
   maxDurationMs: 15 * 60 * 1000, // default, set 0 to disable

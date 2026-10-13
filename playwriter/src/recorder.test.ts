@@ -10,6 +10,7 @@ import { chromium } from '@xmorse/playwright-core'
 import { getCdpUrl } from './utils.js'
 import { getCDPSessionForPage } from './cdp-session.js'
 import { parseRecording, projectThinEvent, sanitizeRecordedBody, sanitizeRecordedUrl } from './action-recorder.js'
+import { readNarrationMetadata } from './narration.js'
 import {
   setupTestContext,
   cleanupTestContext,
@@ -623,5 +624,205 @@ describe('action recording', () => {
     await deleteSession(session.id)
     await browser.close()
     await htmlServer.close()
+  }, 120000)
+
+  it('writes a marker event when the user presses Oops, only while recording', async () => {
+    const browserContext = testCtx!.browserContext
+    const serviceWorker = await getExtensionServiceWorker(browserContext)
+    const page = await browserContext.newPage()
+    await page.goto('https://example.com/?marker')
+    await page.bringToFront()
+    await serviceWorker.evaluate(async () => {
+      await globalThis.toggleExtensionForActiveTab()
+    })
+    await new Promise((r) => setTimeout(r, 200))
+    const session = (await (
+      await fetch(`${SERVER_URL}/cli/session/new`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({}) })
+    ).json()) as { id: string }
+
+    // no active recording -> 404
+    const noneResponse = await fetch(`${SERVER_URL}/recorder/mark`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({}) })
+    expect(noneResponse.status).toBe(404)
+
+    const start = (await (
+      await fetch(`${SERVER_URL}/recorder/start`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ sessionId: session.id }) })
+    ).json()) as { recordingId: string }
+    const markResponse = await fetch(`${SERVER_URL}/recorder/mark`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ recordingId: start.recordingId, kind: 'mistake', note: 'wrong tab' }),
+    })
+    expect(markResponse.status).toBe(200)
+    const mark = (await markResponse.json()) as { recordingId: string; eventId: number }
+    expect(mark.recordingId).toBe(start.recordingId)
+    // unknown kinds fall back to mistake instead of polluting the timeline
+    await fetch(`${SERVER_URL}/recorder/mark`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ kind: 'DROP TABLE' }) })
+    const stop = (await (
+      await fetch(`${SERVER_URL}/recorder/stop`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ recordingId: start.recordingId }) })
+    ).json()) as { filePath: string }
+    const markers = parseRecording(fs.readFileSync(stop.filePath, 'utf-8')).filter((e) => e.type === 'marker')
+    expect(markers.map((e) => [e.id, e.kind, e.note])).toEqual([
+      [mark.eventId, 'mistake', 'wrong tab'],
+      [mark.eventId + 1, 'mistake', undefined],
+    ])
+    await deleteSession(session.id)
+  }, 60000)
+
+  // Chrome runs with a fake microphone and auto-accepted prompts (test-utils),
+  // so this drives the real path: permission check -> offscreen getUserMedia ->
+  // MediaRecorder -> chunks over the extension socket -> file on disk.
+  it('captures microphone narration next to the events when asked, and not otherwise', async () => {
+    const browserContext = testCtx!.browserContext
+    const serviceWorker = await getExtensionServiceWorker(browserContext)
+
+    const page = await browserContext.newPage()
+    await page.goto('https://example.com/?narration')
+    await page.bringToFront()
+    await serviceWorker.evaluate(async () => {
+      await globalThis.toggleExtensionForActiveTab()
+    })
+    await new Promise((r) => setTimeout(r, 200))
+
+    const sessionResponse = await fetch(`${SERVER_URL}/cli/session/new`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({}),
+    })
+    const session = (await sessionResponse.json()) as { id: string }
+
+    // microphone state is readable through the relay (permission is a visible
+    // browser interaction in real Chrome; the fake UI flag answers it here)
+    const micStateResponse = await fetch(`${SERVER_URL}/recorder/microphone`)
+    const micState = (await micStateResponse.json()) as { state: string; hasMicrophone?: boolean; error?: string }
+    expect(['granted', 'prompt'], JSON.stringify(micState)).toContain(micState.state)
+
+    // default is OFF: no narration unless explicitly requested
+    const plainStart = (await (
+      await fetch(`${SERVER_URL}/recorder/start`, {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ sessionId: session.id }),
+      })
+    ).json()) as { recordingId: string; narration: unknown }
+    expect(plainStart.narration).toBeNull()
+    const plainStop = (await (
+      await fetch(`${SERVER_URL}/recorder/stop`, {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ recordingId: plainStart.recordingId }),
+      })
+    ).json()) as { filePath: string; narration: unknown }
+    expect(plainStop.narration).toBeNull()
+    const plainTypes = new Set(parseRecording(fs.readFileSync(plainStop.filePath, 'utf-8')).map((e) => e.type))
+    expect(plainTypes.has('narration-started')).toBe(false)
+    expect(plainTypes.has('narration-unavailable')).toBe(false)
+    expect(fs.existsSync(path.join(recordingsDir!, plainStart.recordingId, 'narration.webm'))).toBe(false)
+
+    // explicit opt-in
+    const startResponse = await fetch(`${SERVER_URL}/recorder/start`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ sessionId: session.id, microphone: true }),
+    })
+    const start = (await startResponse.json()) as {
+      recordingId: string
+      error?: string
+      narration: {
+        active: boolean
+        audioPath?: string
+        audioStartMs?: number
+        mimeType?: string
+        reason?: string
+        error?: string
+      }
+    }
+    expect(start.error).toBeUndefined()
+    expect(start.narration, JSON.stringify(start.narration)).toMatchObject({ active: true })
+    expect(start.narration.audioPath).toBe(path.join(recordingsDir!, start.recordingId, 'narration.webm'))
+    expect(start.narration.mimeType).toContain('audio/webm')
+    expect(start.narration.audioStartMs).toBeGreaterThanOrEqual(0)
+
+    const statusResponse = await fetch(`${SERVER_URL}/recorder/status`)
+    const status = (await statusResponse.json()) as {
+      recordings: Array<{ recordingId: string; narration: { active: boolean } | null }>
+    }
+    expect(status.recordings.find((r) => r.recordingId === start.recordingId)?.narration).toMatchObject({
+      active: true,
+    })
+
+    // let a few 1s MediaRecorder chunks flow
+    await new Promise((r) => setTimeout(r, 2600))
+
+    const stopResponse = await fetch(`${SERVER_URL}/recorder/stop`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ recordingId: start.recordingId }),
+    })
+    const stop = (await stopResponse.json()) as {
+      recordingId: string
+      filePath: string
+      narration: {
+        audioPath: string
+        audioStartMs: number
+        durationMs: number
+        sizeBytes: number
+        endReason: string
+        mimeType: string
+      } | null
+    }
+    expect(stop.recordingId).toBe(start.recordingId)
+    expect(stop.narration, 'narration metadata on stop').toBeTruthy()
+    expect(stop.narration!.endReason).toBe('stopped')
+    expect(stop.narration!.durationMs).toBeGreaterThan(2000)
+    expect(stop.narration!.sizeBytes).toBeGreaterThan(0)
+    expect(fs.statSync(stop.narration!.audioPath).size).toBe(stop.narration!.sizeBytes)
+    // webm/matroska magic bytes: the file is a real container, not a dump of base64
+    const head = fs.readFileSync(stop.narration!.audioPath).subarray(0, 4)
+    expect(head.toString('hex')).toBe('1a45dfa3')
+
+    // metadata sidecar + timeline events for the agent
+    const metadata = readNarrationMetadata({ recordingsDir: recordingsDir!, recordingId: start.recordingId })
+    expect(metadata).toMatchObject({
+      source: 'microphone',
+      audioPath: stop.narration!.audioPath,
+      endReason: 'stopped',
+      transcriptPath: null,
+    })
+    const events = parseRecording(fs.readFileSync(stop.filePath, 'utf-8'))
+    const narrationStarted = events.find((e) => e.type === 'narration-started')
+    expect(narrationStarted).toMatchObject({
+      source: 'microphone',
+      audioPath: stop.narration!.audioPath,
+      audioStartMs: metadata!.audioStartMs,
+    })
+    const narrationStopped = events.find((e) => e.type === 'narration-stopped')
+    expect(narrationStopped).toMatchObject({ reason: 'stopped', sizeBytes: stop.narration!.sizeBytes })
+    const stopped = events.find((e) => e.type === 'recording-stopped')
+    expect((stopped as { narration?: { audioPath?: string } }).narration?.audioPath).toBe(stop.narration!.audioPath)
+    // narration metadata endpoint for remote relays
+    const narrationResponse = await fetch(`${SERVER_URL}/recorder/narration/${start.recordingId}`)
+    expect(narrationResponse.status).toBe(200)
+    expect(((await narrationResponse.json()) as { audioPath: string; transcript: unknown }).transcript).toBeNull()
+
+    // the microphone is released: a second narrated recording starts cleanly
+    const again = (await (
+      await fetch(`${SERVER_URL}/recorder/start`, {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ sessionId: session.id, microphone: true }),
+      })
+    ).json()) as { recordingId: string; narration: { active: boolean } }
+    expect(again.narration).toMatchObject({ active: true })
+    await new Promise((r) => setTimeout(r, 1200))
+    const againStop = (await (
+      await fetch(`${SERVER_URL}/recorder/stop`, {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ recordingId: again.recordingId }),
+      })
+    ).json()) as { narration: { sizeBytes: number } | null }
+    expect(againStop.narration?.sizeBytes).toBeGreaterThan(0)
+
+    await deleteSession(session.id)
   }, 120000)
 })

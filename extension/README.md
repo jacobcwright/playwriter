@@ -42,6 +42,7 @@ This extension uses these permissions for its browser automation purpose:
 - **scripting**: Show the isolated Playwriter toolbar on connected tabs
 - **tabGroups and contextMenus**: Organize connected tabs and support Pin element
 - **tabCapture, offscreen, and clipboardWrite**: Record selected tabs and copy prompts after user actions
+- **Microphone (asked at runtime, off by default)**: Optional spoken narration for skill recordings; Chrome prompts once on a visible Playwriter page, the toolbar shows **Mic live** while capturing, and audio stays on your computer
 - **storage**: Keep a local installation ID and active Remote control session state
 - **identity and identity.email**: Distinguish Chrome profiles connected to the same local relay; these values are not sent through Remote control
 - **webNavigation**: Track navigation and popups opened by connected tabs

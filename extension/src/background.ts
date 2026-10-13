@@ -53,6 +53,22 @@ import {
   ensureOffscreenDocument,
 } from './recording'
 import type { OffscreenCopyTextResult } from './offscreen-types'
+import {
+  cancelAllNarrations,
+  getMicrophoneState,
+  getRecorderMicrophonePreference,
+  peekRecorderMicrophonePreference,
+  handleCancelNarration,
+  handleMicrophonePermissionResult,
+  handleStartNarration,
+  handleStopNarration,
+  hasNarrationForRecording,
+  isNarrationActive,
+  markNarrationEnded,
+  requestMicrophonePermission,
+  setNarrationActiveListener,
+  setRecorderMicrophonePreference,
+} from './narration'
 
 function isTruthy<T>(value: T): value is NonNullable<T> {
   return Boolean(value)
@@ -612,6 +628,9 @@ class ConnectionManager {
     if (!keepTabsForRemote) {
       detachAllTabDebuggers()
     }
+    // The relay owns the narration file; without it the audio has nowhere to
+    // go, so release the microphone immediately rather than at the next stop.
+    cancelAllNarrations()
     this.ws = null
 
     // Only one extension can connect to the relay server at a time.
@@ -1162,6 +1181,36 @@ async function dispatchRelayMessage(message: any, sink: RelayMessageSink): Promi
       logger.error('Failed to cancel recording:', error)
       sink.send({ id: message.id, result: { success: false, error: error.message } })
     }
+    return
+  }
+
+  // Microphone narration for the skill recorder (relay -> extension)
+  if (message.method === 'getMicrophoneState') {
+    sink.send({ id: message.id, result: await getMicrophoneState() })
+    return
+  }
+
+  if (message.method === 'requestMicrophonePermission') {
+    const timeoutMs = (message.params as { timeoutMs?: number } | undefined)?.timeoutMs
+    sink.send({ id: message.id, result: await requestMicrophonePermission({ timeoutMs }) })
+    return
+  }
+
+  if (message.method === 'startNarration') {
+    const result = await handleStartNarration(message.params as Parameters<typeof handleStartNarration>[0])
+    sink.send({ id: message.id, result })
+    return
+  }
+
+  if (message.method === 'stopNarration') {
+    const result = await handleStopNarration(message.params as Parameters<typeof handleStopNarration>[0])
+    sink.send({ id: message.id, result })
+    return
+  }
+
+  if (message.method === 'cancelNarration') {
+    const result = await handleCancelNarration(message.params as Parameters<typeof handleCancelNarration>[0])
+    sink.send({ id: message.id, result })
     return
   }
 
@@ -2076,6 +2125,10 @@ let toolbarRecordingId: string | null = null
 let toolbarStartInFlight = false
 
 // Sync service-worker state into the isolated toolbar after injection.
+// Recording/remote state is dispatched synchronously: a user can click Record
+// right after the toolbar appears, and a late sync would clobber the toolbar's
+// "starting" state. The mic preference needs chrome.storage, so it syncs on
+// its own and only touches the Mic button.
 function syncToolbarState(tabId: number): void {
   chrome.scripting
     .executeScript({
@@ -2088,7 +2141,39 @@ function syncToolbarState(tabId: number): void {
       args: [toolbarRecordingId !== null, remoteTunnel !== null],
     })
     .catch(() => {})
+  setMicStateInTab(tabId, { enabled: peekRecorderMicrophonePreference(), live: isNarrationActive() })
 }
+
+function setMicStateInTab(tabId: number, state: { enabled: boolean; live: boolean }): void {
+  chrome.scripting
+    .executeScript({
+      target: { tabId, allFrames: false },
+      world: 'ISOLATED',
+      func: (micState: { enabled: boolean; live: boolean }) => {
+        window.__playwriterToolbarSetMic?.(micState)
+      },
+      args: [state],
+    })
+    .catch(() => {})
+}
+
+// Every connected tab shows the same Mic state (preference + live capture).
+async function setMicStateInAllTabs(): Promise<void> {
+  const enabled = await getRecorderMicrophonePreference()
+  const live = isNarrationActive()
+  for (const [tabId, tab] of store.getState().tabs) {
+    if (tab.state !== 'connected') {
+      continue
+    }
+    setMicStateInTab(tabId, { enabled, live })
+  }
+}
+
+// Narration going live/off: toolbars flip to "Mic live", icon badge shows MIC.
+setNarrationActiveListener(() => {
+  void setMicStateInAllTabs()
+  void updateIcons()
+})
 
 function setRecorderStateInTab(tabId: number, recording: boolean): void {
   chrome.scripting
@@ -2811,11 +2896,16 @@ async function updateIcons(): Promise<void> {
       }
       return iconConfig.badgeText
     })()
+    // A live microphone is shown on every tab, not only the connected ones.
+    const micLive = isNarrationActive()
+    const badgeColor: [number, number, number, number] | undefined = micLive
+      ? [239, 68, 68, 255]
+      : iconConfig.badgeColor
 
     void chrome.action.setIcon({ tabId, path: iconConfig.path })
-    void chrome.action.setTitle({ tabId, title })
-    if (iconConfig.badgeColor) void chrome.action.setBadgeBackgroundColor({ tabId, color: iconConfig.badgeColor })
-    void chrome.action.setBadgeText({ tabId, text: badgeText })
+    void chrome.action.setTitle({ tabId, title: micLive ? `${title} (microphone recording)` : title })
+    if (badgeColor) void chrome.action.setBadgeBackgroundColor({ tabId, color: badgeColor })
+    void chrome.action.setBadgeText({ tabId, text: micLive ? 'MIC' : badgeText })
   }
 }
 
@@ -3699,6 +3789,62 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false
   }
 
+  // The permission page reports the user's answer to Chrome's microphone prompt.
+  if (message.action === 'microphonePermissionResult') {
+    const pageUrl = chrome.runtime.getURL('src/microphone.html')
+    if (!sender.url?.startsWith(pageUrl)) {
+      return false
+    }
+    handleMicrophonePermissionResult({
+      granted: message.granted === true,
+      error: typeof message.error === 'string' ? message.error : undefined,
+      tabId: sender.tab?.id,
+    })
+    return false
+  }
+
+  // Toolbar Mic toggle: remember the preference, and get the one-time
+  // permission out of the way now rather than when the demo starts.
+  if (message.action === 'actionRecorderSetMic') {
+    const senderTabId = sender.tab?.id
+    if (!senderTabId || sender.frameId !== 0 || store.getState().tabs.get(senderTabId)?.state !== 'connected') {
+      return false
+    }
+    const enabled = message.enabled === true
+    void (async () => {
+      await setRecorderMicrophonePreference(enabled)
+      await setMicStateInAllTabs()
+      if (!enabled) {
+        return
+      }
+      const state = await getMicrophoneState()
+      if (state.state === 'granted') {
+        if (state.hasMicrophone === false) {
+          toastToolbar(senderTabId, 'No microphone found')
+        }
+        return
+      }
+      if (state.state === 'denied') {
+        toastToolbar(senderTabId, 'Mic blocked in Chrome')
+        await requestMicrophonePermission({ timeoutMs: 1000 }).catch(() => {})
+        return
+      }
+      if (state.state === 'unavailable') {
+        toastToolbar(senderTabId, 'Mic unavailable')
+        return
+      }
+      const answered = await requestMicrophonePermission()
+      if (answered.state === 'granted') {
+        toastToolbar(senderTabId, 'Mic ready')
+      } else {
+        toastToolbar(senderTabId, 'Mic not allowed')
+      }
+    })().catch((error) => {
+      logger.error('Mic toggle failed:', error)
+    })
+    return false
+  }
+
   // Action recorder start/stop: isolated toolbar → service worker → relay HTTP endpoint.
   if (message.action === 'actionRecorderStart') {
     const senderTabId = sender.tab?.id
@@ -3709,19 +3855,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false
     }
     toolbarStartInFlight = true
+    const microphone = peekRecorderMicrophonePreference()
     fetch(`http://${RELAY_HOST}:${RELAY_PORT}/recorder/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{}',
+      body: JSON.stringify(microphone ? { microphone: true } : {}),
     })
       .then(async (response) => {
         const result = (await response.json().catch(() => {
           return {}
-        })) as { error?: string; recordingId?: string }
+        })) as {
+          error?: string
+          recordingId?: string
+          narration?: { active: true } | { active: false; reason: string; error: string } | null
+        }
         if (response.ok && result.recordingId) {
           toolbarRecordingId = result.recordingId
           if (senderTabId) {
             setRecorderStateInTab(senderTabId, true)
+            if (result.narration?.active) {
+              toastToolbar(senderTabId, 'Recording. Talk through what you do')
+            } else if (result.narration && !result.narration.active) {
+              toastToolbar(senderTabId, `Recording without mic: ${result.narration.reason.replace(/-/g, ' ')}`)
+            }
           }
           return
         }
@@ -3746,6 +3902,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false
   }
 
+  // Oops button: mark a mistake in the active recording's timeline.
+  if (message.action === 'actionRecorderMark') {
+    const senderTabId = sender.tab?.id
+    if (!senderTabId || sender.frameId !== 0 || store.getState().tabs.get(senderTabId)?.state !== 'connected') {
+      return false
+    }
+    fetch(`http://${RELAY_HOST}:${RELAY_PORT}/recorder/mark`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...(toolbarRecordingId ? { recordingId: toolbarRecordingId } : {}), kind: 'mistake' }),
+    })
+      .then(async (response) => {
+        if (response.ok) {
+          toastToolbar(senderTabId, 'Marked. Redo that step')
+          return
+        }
+        const result = (await response.json().catch(() => ({}))) as { error?: string }
+        toastToolbar(senderTabId, result.error || 'Could not mark')
+      })
+      .catch(() => {
+        toastToolbar(senderTabId, 'Could not mark')
+      })
+    return false
+  }
+
   if (message.action === 'actionRecorderStop') {
     const senderTabId = sender.tab?.id
     if (!senderTabId || sender.frameId !== 0 || store.getState().tabs.get(senderTabId)?.state !== 'connected') {
@@ -3757,7 +3938,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       body: JSON.stringify(toolbarRecordingId ? { recordingId: toolbarRecordingId } : {}),
     })
       .then((r) => r.json())
-      .then(async (result: { recordingId?: string; error?: string }) => {
+      .then(
+        async (result: {
+          recordingId?: string
+          error?: string
+          eventCount?: number
+          narration?: { durationMs?: number; endReason?: string } | null
+        }) => {
         if (!result.recordingId) {
           logger.error('Action recorder stop failed:', result.error || 'unknown')
           if (senderTabId) {
@@ -3767,6 +3954,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         toolbarRecordingId = null
         if (!senderTabId) return
+        const narrated =
+          hasNarrationForRecording(result.recordingId) || Boolean((result as { narration?: unknown }).narration)
         const prompt = [
           'I just recorded a browser workflow (recording ' + result.recordingId + ').',
           'Analyze it and create a reusable skill from it.',
@@ -3776,17 +3965,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           '',
           'Then run:',
           'playwriter recorder events -r ' + result.recordingId,
+          ...(narrated
+            ? [
+                '',
+                'I narrated it with my microphone while recording. The audio and its timing are at:',
+                'playwriter recorder narration -r ' + result.recordingId,
+                'Transcribe it locally first (nothing is uploaded), then re-read the events with the speech inline:',
+                'playwriter recorder transcribe -r ' + result.recordingId,
+                'Use what I said to name steps, explain why each one matters, and find the parameters.',
+              ]
+            : []),
         ].join('\n')
         setRecorderStateInTab(senderTabId, false)
+        // Summary first so the user knows it worked, then the paste hint.
+        const actions = typeof result.eventCount === 'number' ? `${result.eventCount} events` : 'saved'
+        const mic = result.narration
+          ? result.narration.endReason === 'stopped'
+            ? ', voice saved'
+            : ', voice cut short'
+          : ''
         try {
           await copyTextInOffscreenDocument(prompt)
-          toastToolbar(senderTabId, 'Copied prompt')
+          toastToolbar(senderTabId, `Recorded: ${actions}${mic}. Prompt copied, paste it to your agent`)
           playToolbarSound(senderTabId, 'success')
         } catch (error) {
           logger.error('Could not copy recorder prompt:', error)
-          toastToolbar(senderTabId, `Copy failed. Run: playwriter recorder events -r ${result.recordingId}`)
+          toastToolbar(senderTabId, `Recorded: ${actions}${mic}. Run: playwriter recorder events -r ${result.recordingId}`)
         }
-      })
+      },
+      )
       .catch((err) => {
         logger.error('Action recorder stop failed:', err)
       })
@@ -3804,6 +4011,49 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     } catch (error) {
       sendResponse({ success: false, error: error instanceof Error ? error.message : String(error) })
     }
+    return true
+  }
+
+  // Narration audio from the offscreen document -> relay (base64 JSON, so it
+  // never collides with the binary tab-capture chunk routing)
+  if (message.action === 'narrationChunk') {
+    const ws = connectionManager.ws
+    if (ws?.readyState !== WebSocket.OPEN) {
+      sendResponse({ success: false, error: 'Relay is not connected' })
+      return true
+    }
+    const wireBytes = (typeof message.dataBase64 === 'string' ? message.dataBase64.length : 0) + 256
+    if (ws.bufferedAmount + wireBytes > MAX_RECORDING_SOCKET_BUFFERED_BYTES) {
+      sendResponse({ success: false, error: 'Narration socket buffer exceeded its memory limit' })
+      return true
+    }
+    ws.send(
+      JSON.stringify({
+        method: 'narrationChunk',
+        params: { recordingId: message.recordingId, dataBase64: message.dataBase64 },
+      }),
+    )
+    sendResponse({ success: true })
+    return true
+  }
+
+  if (message.action === 'narrationEnded') {
+    const ws = connectionManager.ws
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          method: 'narrationEnded',
+          params: {
+            recordingId: message.recordingId,
+            reason: message.reason,
+            error: message.error,
+            durationMs: message.durationMs,
+          },
+        }),
+      )
+    }
+    markNarrationEnded(message.recordingId)
+    sendResponse({ success: true })
     return true
   }
 

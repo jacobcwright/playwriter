@@ -1600,16 +1600,60 @@ cli
   .option('--host <host>', 'Remote relay server host')
   .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
   .option('-s, --session <id>', 'Session ID (defaults to the single active session, or creates a new one)')
+  .option(
+    '--mic',
+    'Also record the user talking through the workflow (microphone narration). Off by default. Chrome asks for microphone permission once, in a visible Playwriter tab.',
+  )
   .example('playwriter recorder start')
   .example('playwriter recorder start -s 1')
+  .example('playwriter recorder start --mic')
   .action(async (options) => {
     if (!options.host && !process.env.PLAYWRITER_HOST) {
       await ensureRelayServer({ logger: console })
     }
     const serverUrl = await getServerUrl(options.host)
     const headers = buildAuthHeaders({ token: options.token, json: true })
+    const microphone = Boolean(options.mic)
 
     try {
+      // Pre-flight the microphone so the permission prompt happens before the
+      // user starts demonstrating, not in the middle of it. A denied or
+      // missing microphone is reported but never blocks the recording.
+      if (microphone) {
+        const stateResponse = await fetch(`${serverUrl}/recorder/microphone`, {
+          headers: buildAuthHeaders({ token: options.token }),
+          signal: AbortSignal.timeout(15_000),
+        })
+        const micState = (await stateResponse.json()) as { state?: string; hasMicrophone?: boolean; error?: string }
+        if (micState.state === 'prompt') {
+          console.error(
+            'Chrome needs permission to use the microphone. A Playwriter tab just opened: click "Allow microphone" there.',
+          )
+          const requestResponse = await fetch(`${serverUrl}/recorder/microphone`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ timeoutMs: 120_000 }),
+            signal: AbortSignal.timeout(130_000),
+          })
+          const requested = (await requestResponse.json()) as { state?: string; error?: string }
+          if (requested.state !== 'granted') {
+            console.error(
+              `Microphone not allowed (${requested.state || 'unknown'}${requested.error ? `: ${requested.error}` : ''}). Recording continues without narration.`,
+            )
+          }
+        } else if (micState.state === 'denied') {
+          console.error(
+            'Microphone is blocked for the Playwriter extension. Chrome > Settings > Privacy > Site settings > Microphone, or chrome://extensions > Playwriter > Details > Site settings. Recording continues without narration.',
+          )
+        } else if (micState.state === 'unavailable') {
+          console.error(
+            `Microphone unavailable${micState.error ? `: ${micState.error}` : ''}. Recording continues without narration.`,
+          )
+        } else if (micState.hasMicrophone === false) {
+          console.error('No microphone found on this computer. Recording continues without narration.')
+        }
+      }
+
       const sessionId: string = await (async () => {
         const explicit = options.session ? String(options.session) : process.env.PLAYWRITER_SESSION
         if (explicit) {
@@ -1645,10 +1689,18 @@ cli
       const response = await fetch(`${serverUrl}/recorder/start`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ sessionId }),
-        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({ sessionId, microphone }),
+        signal: AbortSignal.timeout(60_000),
       })
-      const result = (await response.json()) as { recordingId?: string; file?: string; error?: string }
+      const result = (await response.json()) as {
+        recordingId?: string
+        file?: string
+        error?: string
+        narration?:
+          | { active: true; audioPath: string; audioStartMs: number; mimeType: string; deviceLabel?: string }
+          | { active: false; reason: string; error: string }
+          | null
+      }
       if (!response.ok || !result.recordingId) {
         console.error(`Error: ${result.error || response.status}`)
         process.exit(1)
@@ -1656,8 +1708,32 @@ cli
 
       console.log(`Recording ${result.recordingId} started on session ${sessionId}.`)
       console.log(`Events file: ${result.file}`)
+      if (microphone) {
+        if (result.narration?.active) {
+          console.log(
+            `Narration: microphone is live${result.narration.deviceLabel ? ` (${result.narration.deviceLabel})` : ''}. Audio file: ${result.narration.audioPath}`,
+          )
+          console.log('Tell the user: talk through what you are doing and why. Click Stop (or say done) when finished.')
+        } else {
+          const reason =
+            result.narration && !result.narration.active
+              ? `${result.narration.reason}: ${result.narration.error}`
+              : 'unknown'
+          console.log(`Narration: NOT recording (${reason}). Actions are still being recorded.`)
+        }
+      }
       console.log('')
-      const promptPath = path.join(__dirname, '..', 'src', 'recorder-prompt.md')
+      // Resolution order: env override, the source tree, then next to the
+      // executable (standalone binaries ship recorder-prompt.md as a sidecar).
+      const promptCandidates = [
+        process.env.PLAYWRITER_PROMPT_DIR ? path.join(process.env.PLAYWRITER_PROMPT_DIR, 'recorder-prompt.md') : '',
+        path.join(__dirname, '..', 'src', 'recorder-prompt.md'),
+        path.join(path.dirname(process.execPath), 'recorder-prompt.md'),
+      ].filter(Boolean)
+      const promptPath = promptCandidates.find((candidate) => fs.existsSync(candidate))
+      if (!promptPath) {
+        throw new Error(`recorder-prompt.md not found. Looked in: ${promptCandidates.join(', ')}`)
+      }
       console.log(fs.readFileSync(promptPath, 'utf-8'))
     } catch (error: any) {
       console.error(`Error: ${error.message}`)
@@ -1683,6 +1759,13 @@ cli
         eventCount?: number
         filePath?: string
         error?: string
+        narration?: {
+          audioPath: string
+          audioStartMs: number
+          durationMs: number
+          endReason: string
+          error?: string
+        } | null
       }
       if (!response.ok || !result.recordingId) {
         console.error(`Error: ${result.error || response.status}`)
@@ -1690,6 +1773,13 @@ cli
       }
       console.log(`Recording ${result.recordingId} stopped. ${result.eventCount} events captured.`)
       console.log(`Events file: ${result.filePath}`)
+      if (result.narration) {
+        const seconds = Math.round(result.narration.durationMs / 1000)
+        console.log(
+          `Narration audio: ${result.narration.audioPath} (${seconds}s, starts at timeline ms ${result.narration.audioStartMs}${result.narration.endReason !== 'stopped' ? `, ended early: ${result.narration.endReason}` : ''})`,
+        )
+        console.log(`  Transcribe locally (optional): playwriter recorder transcribe -r ${result.recordingId}`)
+      }
       console.log('')
       console.log('Next steps (full instructions were printed by `recorder start`):')
       console.log('  1. playwriter skill')
@@ -1711,8 +1801,9 @@ cli
   .option('-r, --recording <id>', 'Recording ID (defaults to the latest recording)')
   .option('--host <host>', 'Remote relay server host')
   .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
-  .option('--type <type>', 'Only print events of this type (e.g. action, network, page-error)')
+  .option('--type <type>', 'Only print events of this type (e.g. action, network, page-error, narration)')
   .option('--full', 'Print full events for the whole timeline instead of the thin view')
+  .option('--no-transcript', 'Do not interleave narration transcript segments (type "narration") into the timeline')
   .example('playwriter recorder events        # latest recording, thin timeline')
   .example(`playwriter recorder events | jq -r '[.id, .t, .type, (.code // .url // empty)] | @tsv'`)
   .example('playwriter recorder events 4 7    # full details of events 4 and 7')
@@ -1742,10 +1833,11 @@ cli
         )
       }
     }
+    const isLocal = !options.host && !process.env.PLAYWRITER_HOST
     const content: string = await (async () => {
       // Local relay: read the jsonl straight from disk. Remote relay: the file
       // lives on the relay's machine, fetch it over HTTP.
-      if (!options.host && !process.env.PLAYWRITER_HOST) {
+      if (isLocal) {
         const { recordingFilePath, latestRecordingId } = await import('./action-recorder.js')
         // No id → latest recording, mirroring `recorder stop` defaulting
         const resolvedId = recordingId ? String(recordingId) : latestRecordingId()
@@ -1771,14 +1863,65 @@ cli
       }
       return await response.text()
     })()
+    // Narration transcript (if one was produced locally) is interleaved as
+    // `narration` events so speech reads in order with the actions
+    const transcriptMerge = await (async (): Promise<{
+      audioStartMs: number
+      segments: import('./narration.js').TranscriptSegment[]
+    } | null> => {
+      // cac exposes `--no-transcript` as options.transcript === false (and
+      // noTranscript in types); check both without widening the type
+      if (options.noTranscript || (options as { transcript?: boolean }).transcript === false) {
+        return null
+      }
+      try {
+        if (isLocal) {
+          const { getRecordingsDir, latestRecordingId } = await import('./action-recorder.js')
+          const { readNarrationMetadata, readNarrationTranscript } = await import('./narration.js')
+          const resolvedId = recordingId ? String(recordingId) : latestRecordingId()
+          if (!resolvedId) {
+            return null
+          }
+          const metadata = readNarrationMetadata({ recordingsDir: getRecordingsDir(), recordingId: resolvedId })
+          const transcript = readNarrationTranscript({ recordingsDir: getRecordingsDir(), recordingId: resolvedId })
+          if (!metadata || !transcript) {
+            return null
+          }
+          return { audioStartMs: metadata.audioStartMs, segments: transcript.segments }
+        }
+        const serverUrl = await getServerUrl(options.host)
+        const response = await fetch(`${serverUrl}/recorder/narration/${recordingId ?? 'latest'}`, {
+          headers: buildAuthHeaders({ token: options.token }),
+          signal: AbortSignal.timeout(10000),
+        })
+        if (!response.ok) {
+          return null
+        }
+        const remote = (await response.json()) as {
+          audioStartMs: number
+          transcript: { segments: import('./narration.js').TranscriptSegment[] } | null
+        }
+        return remote.transcript ? { audioStartMs: remote.audioStartMs, segments: remote.transcript.segments } : null
+      } catch {
+        return null
+      }
+    })()
     const { projectThinEvent, parseRecording } = await import('./action-recorder.js')
+    const { mergeTranscriptIntoEvents } = await import('./narration.js')
     const invalidIds = (eventIds || []).filter((id) => !/^\d+$/.test(String(id)))
     if (invalidIds.length > 0) {
       console.error(`Invalid event ids: ${invalidIds.join(', ')}. Event ids are the numeric 'id' field from the timeline.`)
       process.exit(1)
     }
     const requestedIds = new Set((eventIds || []).map((id) => Number(id)))
-    const events = parseRecording(content)
+    const recorded = parseRecording(content)
+    const events = transcriptMerge
+      ? mergeTranscriptIntoEvents({
+          events: recorded,
+          audioStartMs: transcriptMerge.audioStartMs,
+          segments: transcriptMerge.segments,
+        })
+      : recorded
     for (const event of events) {
       if (requestedIds.size > 0) {
         if (event.id !== undefined && requestedIds.has(Number(event.id))) {
@@ -1794,6 +1937,105 @@ cli
         continue
       }
       console.log(JSON.stringify(projectThinEvent(event)))
+    }
+  })
+
+cli
+  .command(
+    'recorder narration',
+    'Print the narration (microphone) metadata of a recording: audio file path, where it starts on the event timeline, duration, and the local transcript if one exists',
+  )
+  .option('-r, --recording <id>', 'Recording ID (defaults to the latest recording)')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .example('playwriter recorder narration')
+  .example('playwriter recorder narration -r 3')
+  .action(async (options) => {
+    const recordingId = options.recording ? String(options.recording) : undefined
+    const isLocal = !options.host && !process.env.PLAYWRITER_HOST
+    const payload = await (async (): Promise<Record<string, unknown> | null> => {
+      if (isLocal) {
+        const { getRecordingsDir, latestRecordingId } = await import('./action-recorder.js')
+        const { readNarrationMetadata, readNarrationTranscript } = await import('./narration.js')
+        const resolvedId = recordingId ?? latestRecordingId()
+        if (!resolvedId) {
+          console.error(`No recordings found. Start one with 'playwriter recorder start --mic'.`)
+          process.exit(1)
+        }
+        const metadata = readNarrationMetadata({ recordingsDir: getRecordingsDir(), recordingId: resolvedId })
+        if (!metadata) {
+          console.error(
+            `Recording ${resolvedId} has no narration. Record with 'playwriter recorder start --mic' or the toolbar Mic toggle.`,
+          )
+          process.exit(1)
+        }
+        const transcript = readNarrationTranscript({ recordingsDir: getRecordingsDir(), recordingId: resolvedId })
+        return { ...metadata, transcript }
+      }
+      const serverUrl = await getServerUrl(options.host)
+      const response = await fetch(`${serverUrl}/recorder/narration/${recordingId ?? 'latest'}`, {
+        headers: buildAuthHeaders({ token: options.token }),
+        signal: AbortSignal.timeout(10000),
+      })
+      const body = (await response.json()) as Record<string, unknown>
+      if (!response.ok) {
+        console.error(`Error: ${body.error || response.status}`)
+        process.exit(1)
+      }
+      return body
+    })()
+    console.log(JSON.stringify(payload, null, 2))
+    if (payload && !payload.transcript) {
+      console.error('')
+      console.error('No transcript yet. Transcribe locally (nothing is uploaded):')
+      console.error(`  playwriter recorder transcribe -r ${payload.recordingId}`)
+      console.error(
+        'Or listen to the audio file and use the timeline: audio second s = timeline ms audioStartMs + s*1000.',
+      )
+    }
+  })
+
+cli
+  .command(
+    'recorder transcribe',
+    'Transcribe a recording narration with a local speech-to-text tool (whisper.cpp, openai-whisper, or any --command). Writes narration.transcript.json next to the audio; `recorder events` then shows the speech inline. Nothing is uploaded.',
+  )
+  .option('-r, --recording <id>', 'Recording ID (defaults to the latest recording)')
+  .option(
+    '--command <template>',
+    'Custom command; {input} = audio path, {output} = JSON file the command must write ({segments:[{start,end,text}]})',
+  )
+  .option('--model <path>', 'whisper.cpp ggml model path (or set WHISPER_CPP_MODEL)')
+  .example('playwriter recorder transcribe')
+  .example('playwriter recorder transcribe -r 3 --model ~/models/ggml-base.en.bin')
+  .example(`playwriter recorder transcribe --command 'my-stt {input} --json-out {output}'`)
+  .action(async (options) => {
+    if (process.env.PLAYWRITER_HOST) {
+      console.error('recorder transcribe runs where the audio file lives. Run it on the relay machine.')
+      process.exit(1)
+    }
+    const { getRecordingsDir, latestRecordingId } = await import('./action-recorder.js')
+    const { transcribeNarration } = await import('./narration.js')
+    const recordingId = options.recording ? String(options.recording) : latestRecordingId()
+    if (!recordingId) {
+      console.error(`No recordings found. Start one with 'playwriter recorder start --mic'.`)
+      process.exit(1)
+    }
+    try {
+      const result = await transcribeNarration({
+        recordingsDir: getRecordingsDir(),
+        recordingId,
+        command: options.command,
+        model: options.model,
+        logger: { log: console.error, error: console.error },
+      })
+      console.log(`Transcript written (${result.tool}, ${result.segments.length} segments): ${result.transcriptPath}`)
+      console.log(
+        `Read it inline with the actions: playwriter recorder events -r ${recordingId} | jq -r 'select(.type == "narration" or .type == "action") | [.t, .type, (.text // .code)] | @tsv'`,
+      )
+    } catch (error: any) {
+      console.error(`Error: ${error.message}`)
+      process.exit(1)
     }
   })
 
@@ -1826,7 +2068,9 @@ cli
       for (const recording of recordings) {
         const uptime = Math.round((Date.now() - recording.startedAt) / 1000)
         const urls = recording.pageUrls?.length ? recording.pageUrls.join(', ') : recording.lastUrl || '(no pages)'
-        console.log(`Recording ${recording.recordingId} (session ${recording.sessionId}): ${recording.eventCount} events, running ${uptime}s`)
+        const narration = (recording as { narration?: { active: boolean; reason?: string } | null }).narration
+        const narrationLabel = narration ? (narration.active ? ', mic live' : `, mic unavailable (${narration.reason})`) : ''
+        console.log(`Recording ${recording.recordingId} (session ${recording.sessionId}): ${recording.eventCount} events, running ${uptime}s${narrationLabel}`)
         console.log(`  ${urls}`)
         console.log(`  ${recording.filePath}`)
       }
@@ -2275,6 +2519,221 @@ cli.command('skill', 'Print the full playwriter usage instructions').action(() =
   const content = fs.readFileSync(skillPath, 'utf-8')
   console.log(content)
 })
+
+cli
+  .command('cookies import', 'Copy logins (cookies) from your everyday Google Chrome into the Playwriter browser')
+  .option('--from <browser>', z.string().default('chrome').describe('Source browser. Only "chrome" is supported'))
+  .option('--profile <name>', z.string().default('Default').describe('Chrome profile directory, display name or email (see --list-profiles)'))
+  .option('--domains <list>', 'Comma-separated domains to import, with subdomains (e.g. github.com,notion.so)')
+  .option('--all', 'Import every cookie in the profile. Required when --domains is not given')
+  .option('--dry-run', 'Read and decrypt, print the per-domain summary, but do not touch the browser')
+  .option('--list-profiles', 'List Chrome profiles and exit')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .option('-s, --session <id>', 'Session ID (defaults to the single active session, or creates a new one)')
+  .example('playwriter cookies import --from chrome --list-profiles')
+  .example('playwriter cookies import --from chrome --domains github.com,notion.so')
+  .example('playwriter cookies import --from chrome --profile "Profile 1" --all --dry-run')
+  .action(async (options) => {
+    const {
+      assertCookieImportSupported,
+      buildCookieChunkCode,
+      chunkCookies,
+      convertChromeCookieRows,
+      COOKIE_IMPORT_CHUNK_SIZE,
+      deriveChromeCookieKey,
+      formatDomainSummary,
+      getChromeUserDataDir,
+      listChromeProfiles,
+      parseCookieChunkResult,
+      parseDomainList,
+      readChromeCookieRows,
+      readChromeSafeStoragePassword,
+      resolveChromeProfile,
+      startCookieHandoff,
+      summarizeCookiesByDomain,
+    } = await import('./chrome-cookies.js')
+
+    const fail = (message: string): never => {
+      console.error(`Error: ${message}`)
+      process.exit(1)
+    }
+
+    if (String(options.from).toLowerCase() !== 'chrome') {
+      fail(`Unsupported source "${options.from}". Only --from chrome is supported.`)
+    }
+    try {
+      assertCookieImportSupported()
+    } catch (error: any) {
+      fail(error.message)
+    }
+
+    const userDataDir = getChromeUserDataDir()
+    const profiles = listChromeProfiles({ userDataDir })
+    if (profiles.length === 0) {
+      fail(`No Google Chrome profiles found in ${userDataDir}`)
+    }
+
+    if (options.listProfiles) {
+      console.log(`Chrome profiles in ${userDataDir}:\n`)
+      for (const profile of profiles) {
+        const label = [profile.name, profile.email].filter(Boolean).join(' <') + (profile.email ? '>' : '')
+        const cookieNote = profile.cookiesPath ? '' : pc.dim('  (no Cookies file)')
+        console.log(`  ${profile.dir.padEnd(12)} ${label}${cookieNote}`)
+      }
+      console.log('\nUse --profile <dir, name or email> to pick one (default: Default).')
+      return
+    }
+
+    const profile = resolveChromeProfile({ profiles, profile: String(options.profile) })
+    if (!profile) {
+      fail(`Chrome profile "${options.profile}" not found. Run \`playwriter cookies import --list-profiles\` to see them.`)
+    }
+    if (!profile!.cookiesPath) {
+      fail(`Chrome profile "${profile!.dir}" has no Cookies database.`)
+    }
+
+    const domains = parseDomainList(options.domains)
+    const profileLabel = [profile!.dir, profile!.email].filter(Boolean).join(' / ')
+
+    let rows: Awaited<ReturnType<typeof readChromeCookieRows>> = []
+    try {
+      rows = await readChromeCookieRows({ cookiesPath: profile!.cookiesPath! })
+    } catch (error: any) {
+      fail(error.message)
+    }
+
+    // Counting needs no decryption, so the user can see what a profile holds
+    // before any Keychain prompt and without passing --all by accident.
+    if (domains.length === 0 && !options.all) {
+      const counted = convertChromeCookieRows({ rows, key: null })
+      const summary = summarizeCookiesByDomain(counted.cookies)
+      console.log(`Chrome profile ${profileLabel} has ${counted.cookies.length} unexpired cookies across ${summary.length} domains:\n`)
+      console.log(formatDomainSummary(summary))
+      console.log('')
+      console.log('Pick what to import with --domains a.com,b.com (subdomains included), or pass --all to import everything.')
+      process.exit(1)
+    }
+
+    console.error(
+      'Reading the Chrome encryption key from your macOS Keychain. macOS will ask you to allow "security" to access "Chrome Safe Storage" (once; choose "Always Allow" to skip it next time).',
+    )
+    let key: Buffer
+    try {
+      const password = await readChromeSafeStoragePassword()
+      key = deriveChromeCookieKey({ password })
+    } catch (error: any) {
+      fail(error.message)
+    }
+
+    const converted = convertChromeCookieRows({ rows, key: key!, domains })
+    const summary = summarizeCookiesByDomain(converted.cookies)
+    const notes: string[] = []
+    if (converted.expired) notes.push(`${converted.expired} expired`)
+    if (converted.filteredOut) notes.push(`${converted.filteredOut} outside --domains`)
+    if (converted.undecryptable) notes.push(`${converted.undecryptable} could not be decrypted`)
+    const skippedNote = notes.length ? ` (skipped: ${notes.join(', ')})` : ''
+
+    if (converted.cookies.length === 0) {
+      const hint =
+        converted.undecryptable > 0
+          ? ' Decryption failed for every cookie: the Keychain key may belong to a different Chrome install.'
+          : domains.length
+            ? ` No unexpired cookies match --domains ${domains.join(',')}.`
+            : ''
+      fail(`Nothing to import from Chrome profile ${profileLabel}${skippedNote}.${hint}`)
+    }
+
+    console.log(`${options.dryRun ? 'Would import' : 'Importing'} ${converted.cookies.length} cookies from Chrome profile ${profileLabel}${skippedNote}:\n`)
+    console.log(formatDomainSummary(summary))
+    console.log('')
+    if (options.dryRun) {
+      console.log('Dry run: nothing was sent to the browser.')
+      return
+    }
+
+    if (!options.host && !process.env.PLAYWRITER_HOST) {
+      await ensureRelayServer({ logger: console })
+    }
+    const serverUrl = await getServerUrl(options.host)
+    const headers = buildAuthHeaders({ token: options.token, json: true })
+
+    const sessionId: string = await (async () => {
+      const explicit = options.session ? String(options.session) : process.env.PLAYWRITER_SESSION
+      if (explicit) {
+        return explicit
+      }
+      const listResponse = await fetch(`${serverUrl}/cli/sessions`, {
+        headers: buildAuthHeaders({ token: options.token }),
+        signal: AbortSignal.timeout(5000),
+      }).catch(() => null)
+      if (!listResponse) {
+        return fail('Cannot connect to the relay server. Start the Playwriter browser first (`playwriter browser start`).')
+      }
+      const { sessions } = (await listResponse.json()) as { sessions: Array<{ id: string }> }
+      if (sessions.length === 1) {
+        return sessions[0].id
+      }
+      if (sessions.length > 1) {
+        return fail(`Multiple sessions active (${sessions.map((s) => s.id).join(', ')}). Pass -s <id>.`)
+      }
+      const newResponse = await fetch(`${serverUrl}/cli/session/new`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ cwd: process.cwd(), cloudAuth: getRelayCloudAuth() }),
+      })
+      const newResult = (await newResponse.json()) as { id?: string; error?: string }
+      if (!newResponse.ok || !newResult.id) {
+        return fail(`Could not create a session: ${newResult.error || newResponse.status}. Run 'playwriter session new' first, then retry with -s <id>.`)
+      }
+      return newResult.id
+    })()
+
+    // Cookie values are handed to the relay through a one-shot loopback server
+    // rather than inlined in the executed code, because the relay logs that
+    // code to its log file. See startCookieHandoff in chrome-cookies.ts.
+    const chunks = chunkCookies(converted.cookies, COOKIE_IMPORT_CHUNK_SIZE)
+    const handoff = await startCookieHandoff({ chunks })
+    const imported: Array<{ domain: string }> = []
+    const failed: Array<{ name: string; domain: string }> = []
+    try {
+      for (const [index, chunk] of chunks.entries()) {
+        const code = buildCookieChunkCode({ chunkUrl: `${handoff.baseUrl}/${index}` })
+        const timeout = 60_000
+        const response = await undiciFetch(`${serverUrl}/cli/execute`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ sessionId, code, timeout, cwd: process.cwd() }),
+          dispatcher: executeDispatcher,
+          signal: AbortSignal.timeout(timeout + 30_000),
+        })
+        const result = (await response.json().catch(() => null)) as { text?: string; isError?: boolean } | null
+        if (!response.ok || !result || result.isError) {
+          fail(`Browser rejected cookie batch ${index + 1}/${chunks.length}: ${result?.text || response.status}`)
+        }
+        const parsed = parseCookieChunkResult(result!.text || '')
+        if (!parsed) {
+          fail(`Unexpected relay output for cookie batch ${index + 1}/${chunks.length}: ${result!.text}`)
+        }
+        failed.push(...parsed!.failed)
+        const failedKeys = new Set(parsed!.failed.map((f) => `${f.domain}\u0000${f.name}`))
+        imported.push(...chunk.filter((cookie) => !failedKeys.has(`${cookie.domain}\u0000${cookie.name}`)))
+      }
+    } catch (error: any) {
+      if (error.cause?.code === 'ECONNREFUSED') {
+        fail(`Cannot connect to relay server. Check logs at ${LOG_FILE_PATH}`)
+      }
+      fail(error.message)
+    } finally {
+      await handoff.close()
+    }
+
+    console.log(`Imported ${imported.length} cookies into session ${sessionId}${failed.length ? `, ${failed.length} rejected by the browser` : ''}.`)
+    if (failed.length) {
+      console.log(pc.dim(`Rejected: ${failed.slice(0, 10).map((f) => `${f.name}@${f.domain}`).join(', ')}${failed.length > 10 ? ', ...' : ''}`))
+    }
+    console.log('Pages in that session are now logged in where Chrome was. Local storage, IndexedDB and passkeys are not copied.')
+  })
 
 cli.help()
 cli.completions()

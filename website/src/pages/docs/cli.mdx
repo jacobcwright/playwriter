@@ -147,11 +147,14 @@ into a reusable skill. See [Skill Recorder](/docs/skill-recorder) for the full g
 ```bash
 playwriter recorder start                 # start recording user actions (runs in relay daemon)
 playwriter recorder start -s 1            # attach to an existing session
+playwriter recorder start --mic           # also record the user's microphone narration (off by default)
 playwriter recorder stop                  # stop the only active recording
 playwriter recorder stop 3                # stop recording 3 when several are active
 playwriter recorder events                # thin event timeline of the latest recording
 playwriter recorder events 4 7            # full details of events 4 and 7
 playwriter recorder status                # list active recordings and their page urls
+playwriter recorder narration -r 3        # narration audio path + timing metadata
+playwriter recorder transcribe -r 3       # local-only transcription (whisper.cpp / openai-whisper / --command)
 ```
 
 ## Other commands

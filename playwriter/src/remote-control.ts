@@ -355,6 +355,16 @@ export function getRemoteExtensionMethodRejection(method: string): string | null
   if (method === 'startRecording' || method === 'stopRecording' || method === 'cancelRecording') {
     return 'Screen recording is not supported over Remote control yet.'
   }
+  // The microphone belongs to the person at the keyboard, never to a remote peer
+  if (
+    method === 'startNarration' ||
+    method === 'stopNarration' ||
+    method === 'cancelNarration' ||
+    method === 'getMicrophoneState' ||
+    method === 'requestMicrophonePermission'
+  ) {
+    return 'Microphone narration is not available over Remote control.'
+  }
   // Remote peers must never close tabs by ownership key: the handler scans every local tab
   if (method === 'closeTabsForKey') {
     return 'Closing session tabs is not available over Remote control.'

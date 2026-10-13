@@ -39,6 +39,111 @@ writes a **skill**: a SKILL.md of markdown instructions with example playwriter 
   </Step>
 </Steps>
 
+## Narration (microphone)
+
+Some knowledge never shows up in clicks: *why* you pick the second row, what
+to do when the 2FA modal appears, which typed value is an example and which is
+fixed. Turn the **Mic** on and say it out loud while you record. The agent
+gets your voice next to every action and uses it when it writes the skill.
+
+<Steps>
+  <Step title='Turn the mic on (once)'>
+    Click **Mic off** on the toolbar so it reads **Mic on**. The first time, a
+    Playwriter tab opens with one button, **Allow microphone**. Click it and
+    accept Chrome's prompt. The tab closes itself. The preference is remembered.
+    From the CLI: `playwriter recorder start --mic` does the same pre-flight.
+  </Step>
+  <Step title='Record and talk'>
+    Click **Record Skill**. The toolbar shows **Mic live** (red, pulsing) and
+    the extension icon shows a red **MIC** badge while your microphone is
+    captured. Explain what you are doing like you would to a colleague.
+  </Step>
+  <Step title='Oops, then redo'>
+    Clicked the wrong thing? Press **Oops** and redo the step. A `marker` event
+    lands in the timeline and the agent drops the wrong attempt. The Stop button
+    shows the elapsed time so you know the recorder is alive.
+  </Step>
+  <Step title='Stop'>
+    Click **Stop recording**. The microphone is released immediately, a summary
+    toast confirms what was captured, and the copied prompt tells the agent
+    where the audio is and how to use it.
+  </Step>
+</Steps>
+
+Narration is **off by default**. A denied permission or a missing microphone
+never cancels the recording: the actions are still captured, the timeline gets
+a `narration-unavailable` event with the reason, and the toolbar says so.
+
+### What is saved
+
+```
+~/.playwriter/recordings/<id>.json                      events (shared timeline)
+~/.playwriter/recordings/<id>/frames/<ms>.jpg           screenshots
+~/.playwriter/recordings/<id>/narration.webm            your voice (opus)
+~/.playwriter/recordings/<id>/narration.json            audio metadata + timing
+~/.playwriter/recordings/<id>/narration.transcript.json optional, local transcript
+```
+
+Everything stays on your computer. Nothing is uploaded; there is no cloud
+service behind this feature.
+
+The timeline links speech to actions: `narration-started.audioStartMs` is where
+the audio file begins on the event clock, so audio second `s` happened at
+`ms = audioStartMs + s * 1000`. `recording-stopped.narration` repeats the full
+metadata.
+
+```bash
+playwriter recorder narration -r 3     # audio path, audioStartMs, duration, transcript path
+```
+
+### Transcribing (optional, local)
+
+Transcription is a separate step and runs on your machine with a tool you
+already have. `recorder transcribe` finds whisper.cpp (`whisper-cli` plus a
+model via `--model` or `WHISPER_CPP_MODEL`) or openai-whisper (`whisper`), or
+runs any command you give it:
+
+```bash
+playwriter recorder transcribe -r 3
+playwriter recorder transcribe -r 3 --model ~/models/ggml-base.en.bin
+playwriter recorder transcribe -r 3 --command 'my-stt {input} --json {output}'
+```
+
+The result is `narration.transcript.json` (`{ segments: [{ start, end, text }] }`,
+seconds relative to the audio). You can also write that file by hand. Once it
+exists, `recorder events` interleaves the speech with the actions as
+`narration` events:
+
+```
+1   0     recording-started   https://directory.example.com
+n1  0.8   narration           open the submit page, it's under Products
+2   2.1   action              await page.getByRole('link', { name: 'Submit a product' }).click()
+n2  3.5   narration           the name here is just an example, make it a parameter
+4   3.8   action              await page.getByRole('textbox', { name: 'Product name' }).fill('[redacted]')
+```
+
+Pass `--no-transcript` to hide them.
+
+### Mixed microphone and tab audio
+
+The skill recorder captures the microphone only (it spans many tabs). Video
+recordings made with `recording.start` can mix the microphone into the tab
+capture: `recording.start({ page, outputPath, audio: true, microphone: true })`.
+Tab-only audio (`audio: true`) behaves exactly as before.
+
+### Limitations
+
+- Chrome asks for the microphone once per Chrome profile. Playwriter cannot
+  answer the prompt for you; the permission page is the visible interaction.
+- The relay has to be running (any `playwriter` command starts it) and the
+  extension connected. Narration over **Remote control** is refused: the
+  microphone belongs to the person at the keyboard.
+- Audio is opus in a WebM container, 48 kbps mono. Chrome only emits
+  MediaRecorder chunks about once per second, so the last fraction of a second
+  before Stop may be missing.
+- If the relay restarts mid-recording the narration ends with
+  `endReason: "error"` and the audio captured so far is kept.
+
 ## Why record instead of describe
 
 - **You know the app, the agent doesn't.** Recording captures the exact sequence,
@@ -208,6 +313,8 @@ Every event is one JSON line with a timestamp (`t`, seconds since start):
 | Event type                    | What it captures                                                                                                                                                          |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `action`                      | Click, fill, press, select, setInputFiles — with generated Playwright locator code                                                                                        |
+| `narration-started` / `narration-stopped` / `narration-unavailable` | Microphone narration lifecycle: audio path, `audioStartMs`, duration, or why the mic could not be used                                              |
+| `narration`                   | A transcript segment (`text`, `ms`, `endMs`), only when a local transcript exists                                                                                         |
 | `network`                     | POST/PUT/PATCH/DELETE xhr/fetch only: method, url, status, post data, and **response bodies** for JSON/text. **WebSockets are not recorded.**                             |
 | `download`                    | File downloads: source url and suggested filename                                                                                                                         |
 | `navigation`                  | Full navigations                                                                                                                                                          |

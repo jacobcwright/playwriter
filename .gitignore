@@ -1,6 +1,7 @@
 node_modules
 .vercel
 dist
+dist-bin
 extension/dist*
 esm
 .DS_Store

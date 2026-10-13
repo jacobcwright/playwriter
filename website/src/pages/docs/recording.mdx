@@ -45,6 +45,7 @@ Save the full result to `state` because `executionTimestamps` is needed for `cre
 | `outputPath` | string | required | Absolute path for the output MP4 |
 | `frameRate` | number | 30 | Frames per second |
 | `audio` | boolean | false | Record tab audio |
+| `microphone` | boolean | false | Mix the user's microphone into the audio track (with tab audio when `audio` is true). Needs the one-time microphone permission, see [Skill Recorder: narration](/docs/skill-recorder#narration-microphone) |
 | `videoBitsPerSecond` | number | 2500000 | Video bitrate |
 | `aspectRatio` | object \| null | `{ width: 16, height: 9 }` | Auto-resize viewport; `null` to skip |
 | `maxDurationMs` | number | 15 min | Auto-stop safety limit; `0` to disable |

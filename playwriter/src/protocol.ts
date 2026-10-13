@@ -295,6 +295,40 @@ export type RecordingCancelledMessage = {
   }
 }
 
+// ============================================================================
+// Narration (microphone) messages for the skill recorder. Additive: an older
+// extension that does not know these methods simply never sends them and
+// answers startNarration with an error, which the relay treats as
+// "narration unavailable" without failing the action recording.
+// ============================================================================
+
+/** One encoded audio chunk from the extension's MediaRecorder (base64 so it
+ *  never collides with the binary tab-capture chunks keyed by tabId). */
+export type NarrationChunkMessage = {
+  id?: undefined
+  method: 'narrationChunk'
+  params: {
+    recordingId: string
+    dataBase64: string
+  }
+}
+
+export type NarrationEndReason = 'stopped' | 'cancelled' | 'device-lost' | 'error'
+
+/** Sent once after the last chunk. `stopped` follows a stopNarration command;
+ *  the other reasons mean the capture died on its own (device unplugged,
+ *  MediaRecorder error) and the relay should finalize what it has. */
+export type NarrationEndedMessage = {
+  id?: undefined
+  method: 'narrationEnded'
+  params: {
+    recordingId: string
+    reason: NarrationEndReason
+    error?: string
+    durationMs?: number
+  }
+}
+
 export type ExtensionHelloMessage = {
   id?: undefined
   method: 'hello'
@@ -320,6 +354,8 @@ export type ExtensionMessage =
   | ExtensionPongMessage
   | RecordingDataMessage
   | RecordingCancelledMessage
+  | NarrationChunkMessage
+  | NarrationEndedMessage
   | ExtensionHelloMessage
   | ExtensionReadyMessage
 
@@ -327,6 +363,11 @@ export type ExtensionMessage =
 export type StartRecordingParams = {
   /** CDP tab session ID (pw-tab-*) to identify which tab to record. */
   sessionId?: string
+  /** Mix the user's microphone into the recording's audio track (default:
+   *  false). With `audio: true` the tab audio and the microphone are mixed;
+   *  without it the microphone is the only audio. Needs microphone permission
+   *  granted to the extension (see `requestMicrophonePermission`). */
+  microphone?: boolean
   frameRate?: number
   audio?: boolean
   videoBitsPerSecond?: number
@@ -485,6 +526,100 @@ export type CancelRecordingResult = {
   success: boolean
   error?: string
 }
+
+// ============================================================================
+// Narration command types (relay -> extension). The relay asks the extension
+// to capture the microphone while an action recording runs; audio chunks come
+// back as NarrationChunkMessage and the relay writes the file.
+// ============================================================================
+
+export type MicrophonePermissionState = 'granted' | 'denied' | 'prompt' | 'unavailable'
+
+export type MicrophoneStateResult = {
+  state: MicrophonePermissionState
+  /** false when no audio input device is present (may be unknown before permission) */
+  hasMicrophone?: boolean
+  error?: string
+}
+
+export type GetMicrophoneStateMessage = {
+  id: number
+  method: 'getMicrophoneState'
+  params: Record<string, never>
+}
+
+/** Opens the extension's microphone page (a visible tab) when permission has
+ *  not been decided yet, and resolves once the user allowed or denied it. */
+export type RequestMicrophonePermissionMessage = {
+  id: number
+  method: 'requestMicrophonePermission'
+  params: {
+    /** Max ms to wait for the user (default 120000) */
+    timeoutMs?: number
+  }
+}
+
+export type StartNarrationParams = {
+  recordingId: string
+  /** Opus bitrate (default 48000) */
+  audioBitsPerSecond?: number
+}
+
+export type NarrationFailureReason =
+  | 'permission-denied'
+  | 'permission-pending'
+  | 'no-microphone'
+  | 'capture-failed'
+  | 'unsupported'
+  | 'already-active'
+
+export type StartNarrationResult =
+  | {
+      success: true
+      recordingId: string
+      /** Epoch ms when MediaRecorder actually started (same machine clock as the relay) */
+      startedAt: number
+      mimeType: string
+      deviceLabel?: string
+    }
+  | {
+      success: false
+      reason: NarrationFailureReason
+      error: string
+    }
+
+export type StopNarrationParams = {
+  recordingId: string
+}
+
+export type StopNarrationResult =
+  | { success: true; recordingId: string; durationMs: number }
+  | { success: false; error: string }
+
+export type StartNarrationMessage = {
+  id: number
+  method: 'startNarration'
+  params: StartNarrationParams
+}
+
+export type StopNarrationMessage = {
+  id: number
+  method: 'stopNarration'
+  params: StopNarrationParams
+}
+
+export type CancelNarrationMessage = {
+  id: number
+  method: 'cancelNarration'
+  params: StopNarrationParams
+}
+
+export type NarrationCommandMessage =
+  | GetMicrophoneStateMessage
+  | RequestMicrophonePermissionMessage
+  | StartNarrationMessage
+  | StopNarrationMessage
+  | CancelNarrationMessage
 
 // ============================================================================
 // Streaming types (HTTP-only, used by /stream/* endpoints).

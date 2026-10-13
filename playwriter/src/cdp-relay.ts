@@ -540,6 +540,7 @@ export async function startPlayWriterCDPRelayServer({
   }
 
   const streamRelays = new Map<string, StreamRelay>()
+  let actionRecordingManagerPromise: Promise<import('./action-recorder.js').ActionRecordingManager> | null = null
 
   const getStreamRelay = (extensionId?: string | null): StreamRelay | null => {
     const allowDefault = !extensionId && relayState.getLocalExtensions(store.getState()).length === 1
@@ -1689,6 +1690,21 @@ export async function startPlayWriterCDPRelayServer({
                 relay.handleRecordingCancelled(message)
               }
             }
+          } else if (message.method === 'narrationChunk') {
+            // Skill recorder microphone audio. The manager promise is already
+            // settled (narration only starts from /recorder/start), so these
+            // .then callbacks run FIFO and chunk order is preserved.
+            if (actionRecordingManagerPromise) {
+              void actionRecordingManagerPromise.then((manager) => {
+                manager.handleNarrationChunk(message.params)
+              })
+            }
+          } else if (message.method === 'narrationEnded') {
+            if (actionRecordingManagerPromise) {
+              void actionRecordingManagerPromise.then((manager) => {
+                manager.handleNarrationEnded(message.params)
+              })
+            }
           } else {
             const extensionEvent = message
 
@@ -1983,6 +1999,11 @@ export async function startPlayWriterCDPRelayServer({
             recordingRelay.destroyAll('Extension disconnected')
           }
           recordingRelays.delete(connectionId)
+          if (actionRecordingManagerPromise) {
+            void actionRecordingManagerPromise.then((manager) => {
+              manager.destroyNarrations('Extension disconnected')
+            })
+          }
           const streamRelay = streamRelays.get(connectionId)
           if (streamRelay) {
             streamRelay.destroyAll('Extension disconnected')
@@ -2218,7 +2239,8 @@ export async function startPlayWriterCDPRelayServer({
     // Websites still cannot call these: CORS only allows our extension origin,
     // so a page preflight fails and the POST is never sent.
     const secFetchSite = c.req.header('sec-fetch-site')
-    const isRecorderToggle = c.req.path === '/recorder/start' || c.req.path === '/recorder/stop'
+    const isRecorderToggle =
+      c.req.path === '/recorder/start' || c.req.path === '/recorder/stop' || c.req.path === '/recorder/mark'
     if (!isRecorderToggle && secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
       logger?.log(pc.red(`Rejecting ${c.req.path}: cross-origin browser request (Sec-Fetch-Site: ${secFetchSite})`))
       return c.text('Forbidden - Cross-origin requests not allowed', 403)
@@ -2863,7 +2885,8 @@ export async function startPlayWriterCDPRelayServer({
   // ============================================================================
 
   // Memoized as a promise so concurrent first calls share one manager instance
-  let actionRecordingManagerPromise: Promise<import('./action-recorder.js').ActionRecordingManager> | null = null
+  // (declared next to recordingRelays so the extension socket handlers can
+  // route narration messages and disconnects to it)
   const getActionRecordingManager = () => {
     if (!actionRecordingManagerPromise) {
       actionRecordingManagerPromise = import('./action-recorder.js').then(({ ActionRecordingManager }) => {
@@ -2891,8 +2914,94 @@ export async function startPlayWriterCDPRelayServer({
     return 500
   }
 
+  // Relay -> extension narration commands for the extension that owns a
+  // session. Everything stays on this machine: chunks come back over the same
+  // socket and are written under ~/.playwriter/recordings/<id>/.
+  const narrationTransportFor = (extensionId: string | null): import('./narration.js').NarrationTransport => {
+    const send = (method: string, params: unknown, timeout: number) => {
+      return sendToExtension({ extensionId, method, params, timeout })
+    }
+    return {
+      start: async (params) => {
+        return (await send('startNarration', params, 20_000)) as import('./protocol.js').StartNarrationResult
+      },
+      stop: async (params) => {
+        return (await send('stopNarration', params, 10_000)) as import('./protocol.js').StopNarrationResult
+      },
+      cancel: async (params) => {
+        await send('cancelNarration', params, 5_000)
+      },
+    }
+  }
+
+  // Microphone permission state / request. The request opens a visible
+  // extension page in Chrome and resolves once the user decided, so the CLI
+  // can pre-flight before `recorder start --mic`.
+  // Same extension pick as the toolbar start: the only local extension, or the
+  // one with Playwriter-enabled tabs.
+  const microphoneExtensionId = (): string => {
+    const conn = getExtensionConnection(null, {
+      allowFallback: relayState.getLocalExtensions(store.getState()).length >= 1,
+    })
+    if (!conn) {
+      throw new Error('Extension is not connected. Enable Playwriter on a tab first.')
+    }
+    return conn.id
+  }
+
+  app.get('/recorder/microphone', async (c) => {
+    try {
+      const result = await sendToExtension({
+        extensionId: microphoneExtensionId(),
+        method: 'getMicrophoneState',
+        params: {},
+        timeout: 10_000,
+      })
+      return c.json(result)
+    } catch (error: any) {
+      return c.json({ state: 'unavailable', error: error.message }, 500)
+    }
+  })
+
+  app.post('/recorder/microphone', async (c) => {
+    const body: { timeoutMs?: number } = await c.req.json().catch(() => ({}))
+    const timeoutMs = Math.min(Math.max(Number(body.timeoutMs) || 120_000, 1_000), 600_000)
+    try {
+      const result = await sendToExtension({
+        extensionId: microphoneExtensionId(),
+        method: 'requestMicrophonePermission',
+        params: { timeoutMs },
+        timeout: timeoutMs + 5_000,
+      })
+      return c.json(result)
+    } catch (error: any) {
+      return c.json({ state: 'unavailable', error: error.message }, 500)
+    }
+  })
+
+  // Narration metadata (audio path + timing) so `recorder narration` works
+  // against a remote relay too
+  app.get('/recorder/narration/:id', async (c) => {
+    const { getRecordingsDir, latestRecordingId } = await import('./action-recorder.js')
+    const { readNarrationMetadata, readNarrationTranscript } = await import('./narration.js')
+    const param = c.req.param('id')
+    if (param !== 'latest' && !/^\d+$/.test(param)) {
+      return c.json({ error: 'Invalid recording id' }, 400)
+    }
+    const recordingId = param === 'latest' ? latestRecordingId() : param
+    if (!recordingId) {
+      return c.json({ error: 'No recordings found' }, 404)
+    }
+    const metadata = readNarrationMetadata({ recordingsDir: getRecordingsDir(), recordingId })
+    if (!metadata) {
+      return c.json({ error: `Recording ${recordingId} has no narration` }, 404)
+    }
+    const transcript = readNarrationTranscript({ recordingsDir: getRecordingsDir(), recordingId })
+    return c.json({ ...metadata, transcript })
+  })
+
   app.post('/recorder/start', async (c) => {
-    let body: { sessionId?: string | number }
+    let body: { sessionId?: string | number; microphone?: boolean }
     try {
       body = await c.req.json()
     } catch {
@@ -2937,12 +3046,21 @@ export async function startPlayWriterCDPRelayServer({
       if (!executor) {
         return c.json({ error: `Session ${sessionId} not found. Run 'playwriter session new' first.` }, 404)
       }
+      const microphone = body.microphone === true
+      const narration = microphone
+        ? { transport: narrationTransportFor(executor.getSessionInfo({ id: sessionId }).extensionId) }
+        : undefined
       const recorder = await executor.withBrowserContext({
         operation: async (context) => {
-          return recordingManager.start({ context, sessionId })
+          return recordingManager.start({ context, sessionId, narration })
         },
       })
-      return c.json({ recordingId: recorder.recordingId, sessionId, file: recorder.filePath })
+      return c.json({
+        recordingId: recorder.recordingId,
+        sessionId,
+        file: recorder.filePath,
+        narration: microphone ? recorder.narrationStartOutcome() : null,
+      })
     } catch (error: any) {
       logger?.error('Record start endpoint error:', error)
       return c.json({ error: error.message }, recordingErrorStatus(error))
@@ -2962,6 +3080,25 @@ export async function startPlayWriterCDPRelayServer({
         recordings ? { error: error.message, recordings } : { error: error.message },
         recordingErrorStatus(error),
       )
+    }
+  })
+
+  // Marker in the timeline (toolbar Oops button): kind 'mistake' means "what I
+  // just did was wrong, I'm redoing it"; agents drop the actions before it.
+  app.post('/recorder/mark', async (c) => {
+    try {
+      const body: { recordingId?: string | number; kind?: string; note?: string } = await c.req.json().catch(() => ({}))
+      const kind = typeof body.kind === 'string' && /^[a-z-]{1,32}$/.test(body.kind) ? body.kind : 'mistake'
+      const recordingManager = await getActionRecordingManager()
+      const result = recordingManager.mark({
+        recordingId: normalizeSessionId(body.recordingId) || undefined,
+        kind,
+        note: typeof body.note === 'string' ? body.note : undefined,
+      })
+      return c.json(result)
+    } catch (error: any) {
+      const recordings = (error as { recordings?: unknown }).recordings
+      return c.json(recordings ? { error: error.message, recordings } : { error: error.message }, recordingErrorStatus(error))
     }
   })
 

@@ -14,6 +14,7 @@ declare global {
     __playwriterToolbarSetRecording?: (recording: boolean) => void
     __playwriterToolbarStopRecording?: (() => void) | null
     __playwriterToolbarStartRecording?: (() => void) | null
+    __playwriterToolbarSetMic?: (state: { enabled: boolean; live: boolean }) => void
     __playwriterToolbarSetRemote?: (active: boolean) => void
     __playwriterToolbarStartRemote?: (() => void) | null
     __playwriterToolbarStopRemote?: (() => void) | null
@@ -44,6 +45,10 @@ export function initPlaywriterToolbar(): void {
   let isRecording = false
   let startInFlight = false
   let pendingStop = false
+  // Microphone narration: `micEnabled` is the remembered preference, `micLive`
+  // means the microphone is being captured right now.
+  let micEnabled = false
+  let micLive = false
   let isDragging = false
   // Declared here so the hoisted setPinMode can reference it before assignment.
   let pinBtn!: HTMLButtonElement
@@ -226,6 +231,27 @@ export function initPlaywriterToolbar(): void {
     }
     .record-btn.loading {
       cursor: progress;
+    }
+    .mic-btn {
+      padding: 3px 6px;
+    }
+    .mic-btn.on {
+      color: rgba(228,228,231,1);
+    }
+    .mic-btn.live {
+      color: #fca5a5;
+    }
+    .mic-btn.live svg {
+      animation: mic-pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes mic-pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(0.88); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .mic-btn.live svg {
+        animation: none;
+      }
     }
     .remote-btn svg {
       color: #7dd3fc;
@@ -788,6 +814,11 @@ export function initPlaywriterToolbar(): void {
   // Record circle icon (red filled circle)
   const RECORD_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="#ef4444"/></svg>`
 
+  // Lucide mic / mic-off icons (microphone narration toggle)
+  const MIC_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>`
+  const MIC_LIVE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="#ef4444" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path fill="none" d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>`
+  const MIC_OFF_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="2" y1="2" x2="22" y2="22"/><path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2"/><path d="M5 10v2a7 7 0 0 0 12 5"/><path d="M15 9.34V5a3 3 0 0 0-5.68-1.33"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/><line x1="12" y1="19" x2="12" y2="22"/></svg>`
+
   // Stop square icon (red filled square)
   const STOP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2" fill="#ef4444"/></svg>`
 
@@ -945,10 +976,29 @@ export function initPlaywriterToolbar(): void {
   const recordBtn = document.createElement('button')
   recordBtn.className = 'record-btn'
 
+  // Elapsed time on the Stop button: non-technical users need to see that
+  // the recorder is alive. Starts counting when the relay confirms the start.
+  let recordingStartedAt = 0
+  let recordTimer: number | null = null
+
+  function formatElapsed(): string {
+    const total = Math.max(0, Math.floor((Date.now() - recordingStartedAt) / 1000))
+    const minutes = Math.floor(total / 60)
+    const seconds = total % 60
+    return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`
+  }
+
+  function stopRecordTimer(): void {
+    if (recordTimer !== null) {
+      window.clearInterval(recordTimer)
+      recordTimer = null
+    }
+  }
+
   function updateRecordBtn(): void {
     recordBtn.classList.remove('active', 'loading')
     if (isRecording) {
-      recordBtn.innerHTML = STOP_SVG + ' <span>Stop recording\u2026</span>'
+      recordBtn.innerHTML = STOP_SVG + ' <span>Stop \u00b7 ' + formatElapsed() + '</span>'
       recordBtn.setAttribute('data-tooltip', 'Stop recording')
       recordBtn.classList.add('active')
       return
@@ -970,8 +1020,18 @@ export function initPlaywriterToolbar(): void {
       isRecording = recording
       if (recording) {
         setPinMode(false)
+        recordingStartedAt = Date.now()
+        stopRecordTimer()
+        recordTimer = window.setInterval(() => {
+          if (isRecording) {
+            updateRecordBtn()
+          }
+        }, 1000)
+      } else {
+        stopRecordTimer()
       }
     }
+    oopsBtn.style.display = recording ? '' : 'none'
     updateRecordBtn()
     if (recording && pendingStop) {
       pendingStop = false
@@ -1005,6 +1065,67 @@ export function initPlaywriterToolbar(): void {
     startInFlight = true
     updateRecordBtn()
     window.__playwriterToolbarStartRecording()
+  })
+
+  // Oops: visible only while recording. Marks "what I just did was wrong, I'm
+  // redoing it" in the timeline so the agent drops those actions.
+  const oopsBtn = document.createElement('button')
+  oopsBtn.className = 'record-btn oops-btn'
+  oopsBtn.innerHTML = '<span>Oops</span>'
+  oopsBtn.setAttribute('data-tooltip', 'Mark the last step as a mistake')
+  oopsBtn.style.display = 'none'
+  oopsBtn.addEventListener('click', (e: MouseEvent) => {
+    e.stopPropagation()
+    if (!isTrustedToolbarClick(e) || !isRecording) {
+      return
+    }
+    playSound('click')
+    void chrome.runtime.sendMessage({ action: 'actionRecorderMark' })
+  })
+
+  // Mic toggle: off by default. Click to remember "narrate my recordings".
+  // While the microphone is captured the icon turns red and pulses.
+  const micBtn = document.createElement('button')
+  micBtn.className = 'record-btn mic-btn'
+
+  function updateMicBtn(): void {
+    micBtn.classList.remove('on', 'live')
+    if (micLive) {
+      micBtn.innerHTML = MIC_LIVE_SVG + ' <span>Mic live</span>'
+      micBtn.setAttribute('data-tooltip', 'Microphone is recording')
+      micBtn.classList.add('live')
+      return
+    }
+    if (micEnabled) {
+      micBtn.innerHTML = MIC_SVG + ' <span>Mic on</span>'
+      micBtn.setAttribute('data-tooltip', 'Narration on. Click to turn off')
+      micBtn.classList.add('on')
+      return
+    }
+    micBtn.innerHTML = MIC_OFF_SVG + ' <span>Mic off</span>'
+    micBtn.setAttribute('data-tooltip', 'Narrate recordings with your microphone')
+  }
+  updateMicBtn()
+
+  function setMic(state: { enabled: boolean; live: boolean }): void {
+    micEnabled = state.enabled
+    micLive = state.live
+    updateMicBtn()
+  }
+
+  micBtn.addEventListener('click', (e: MouseEvent) => {
+    e.stopPropagation()
+    if (!isTrustedToolbarClick(e)) {
+      return
+    }
+    if (micLive) {
+      showToast('Stop the recording to turn the mic off')
+      return
+    }
+    playSound('click')
+    micEnabled = !micEnabled
+    updateMicBtn()
+    void chrome.runtime.sendMessage({ action: 'actionRecorderSetMic', enabled: micEnabled })
   })
 
   const sep2 = document.createElement('div')
@@ -1323,6 +1444,8 @@ export function initPlaywriterToolbar(): void {
     toolbarEl.appendChild(pinBtn)
     toolbarEl.appendChild(sep1)
     toolbarEl.appendChild(recordBtn)
+    toolbarEl.appendChild(oopsBtn)
+    toolbarEl.appendChild(micBtn)
     toolbarEl.appendChild(sep2)
     toolbarEl.appendChild(remoteBtn)
     toolbarEl.appendChild(sep3)
@@ -1358,6 +1481,8 @@ export function initPlaywriterToolbar(): void {
 
   window.__playwriterToolbarSetRecording = setRecording
 
+  window.__playwriterToolbarSetMic = setMic
+
   window.__playwriterToolbarSetRemote = setRemote
 
   window.__playwriterToolbarStartRecording = () => {
@@ -1380,6 +1505,7 @@ export function initPlaywriterToolbar(): void {
 
   window.__playwriterToolbarDestroy = function (): void {
     setPinMode(false)
+    stopRecordTimer()
     hideRemotePanels()
     document.removeEventListener('mousedown', onDocMouseDown, true)
     document.removeEventListener('keydown', onRemoteKeyDown, true)
@@ -1391,6 +1517,7 @@ export function initPlaywriterToolbar(): void {
     delete window.__playwriterToolbarSetRecording
     delete window.__playwriterToolbarStopRecording
     delete window.__playwriterToolbarStartRecording
+    delete window.__playwriterToolbarSetMic
     delete window.__playwriterToolbarSetRemote
     delete window.__playwriterToolbarStartRemote
     delete window.__playwriterToolbarStopRemote

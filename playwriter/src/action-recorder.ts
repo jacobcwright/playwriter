@@ -10,6 +10,13 @@ import path from 'node:path'
 import type { BrowserContext, Frame, Page, Request } from '@xmorse/playwright-core'
 import { getCDPSessionForPage, type ICDPSession } from './cdp-session.js'
 import { isRemoteExtensionKey } from './relay-state.js'
+import {
+  NarrationCapture,
+  type NarrationMetadata,
+  type NarrationStartOutcome,
+  type NarrationTransport,
+} from './narration.js'
+import type { NarrationEndReason } from './protocol.js'
 
 // Read at call time (not module load) so tests can point recordings at a temp
 // dir via PLAYWRITER_RECORDINGS_DIR without polluting ~/.playwriter
@@ -414,6 +421,8 @@ export interface ActionRecorderOptions {
   disableTimeoutMs?: number
   /** Test seam: resolve after enable, before the recording is marked ready. */
   holdAfterEnable?: () => Promise<void>
+  /** Capture the user's microphone alongside the events (off unless given) */
+  narration?: { transport: NarrationTransport; stopTimeoutMs?: number }
 }
 
 export class ActionRecorder {
@@ -447,6 +456,9 @@ export class ActionRecorder {
   private onRequestFailedHandler: ((request: Request) => void) | null = null
   private framesDir: string | undefined
   private frameCount = 0
+  private narrationOptions: ActionRecorderOptions['narration'] | null
+  private narration: NarrationCapture | null = null
+  private narrationOutcome: NarrationStartOutcome | null = null
   private screencasts = new Map<Page, { session: ICDPSession; onFrame: (event: { data: string; sessionId: number; metadata?: { timestamp?: number } }) => void }>()
 
   constructor(options: ActionRecorderOptions) {
@@ -459,6 +471,7 @@ export class ActionRecorder {
     this.enableTimeoutMs = options.enableTimeoutMs ?? DEFAULT_RECORDER_ENABLE_TIMEOUT_MS
     this.disableTimeoutMs = options.disableTimeoutMs ?? DEFAULT_RECORDER_DISABLE_TIMEOUT_MS
     this.holdAfterEnable = options.holdAfterEnable ?? null
+    this.narrationOptions = options.narration ?? null
   }
 
   get eventCount() {
@@ -641,6 +654,7 @@ export class ActionRecorder {
       urls: this.context.pages().map((p) => safePageUrl(p)),
     })
     await Promise.all(this.context.pages().map((page) => this.startPageScreencast(page)))
+    await this.startNarration()
     if (this.holdAfterEnable) {
       await this.holdAfterEnable()
     }
@@ -651,9 +665,104 @@ export class ActionRecorder {
     this.scheduleMaxDurationStop()
   }
 
-  async stop(options?: { reason?: RecordingStopReason }): Promise<{ eventCount: number; filePath: string }> {
+  // Microphone narration is best effort: a denied permission or a missing
+  // microphone must never lose the demonstration itself. The outcome is
+  // written to the timeline either way so the agent knows what it has.
+  private async startNarration() {
+    if (!this.narrationOptions || this.state !== 'starting') {
+      return
+    }
+    this.narration = new NarrationCapture({
+      recordingId: this.recordingId,
+      recordingsDir: getRecordingsDir(),
+      recordingStartedAt: this.startedAt,
+      transport: this.narrationOptions.transport,
+      logger: this.logger,
+      stopTimeoutMs: this.narrationOptions.stopTimeoutMs,
+    })
+    const outcome = await this.narration.start()
+    this.narrationOutcome = outcome
+    if (outcome.active) {
+      this.writeEvent({
+        type: 'narration-started',
+        source: 'microphone',
+        audioPath: outcome.audioPath,
+        audioStartMs: outcome.audioStartMs,
+        mimeType: outcome.mimeType,
+        deviceLabel: outcome.deviceLabel,
+      })
+      return
+    }
+    this.writeEvent({
+      type: 'narration-unavailable',
+      source: 'microphone',
+      reason: outcome.reason,
+      error: outcome.error,
+    })
+  }
+
+  /** User-placed marker (toolbar Oops button, or `recorder mark`). Written at
+   *  the time it arrives so it sits between the right actions. */
+  mark({ kind, note }: { kind: string; note?: string }): number {
+    if (this.state !== 'recording') {
+      throw new RecordingError('Recording is not active', 409)
+    }
+    return this.writeEvent({ type: 'marker', kind, note: note ? truncate(note, 500) : undefined })
+  }
+
+  narrationStartOutcome(): NarrationStartOutcome | null {
+    return this.narrationOutcome
+  }
+
+  narrationMetadata(): NarrationMetadata | null {
+    return this.narration?.metadata() ?? null
+  }
+
+  handleNarrationChunk(dataBase64: string): void {
+    this.narration?.handleChunk(dataBase64)
+  }
+
+  handleNarrationEnded(params: { reason: NarrationEndReason; error?: string; durationMs?: number }): void {
+    if (!this.narration) {
+      return
+    }
+    const wasActive = this.narration.isActive
+    this.narration.handleEnded(params)
+    // Ended on its own (device lost, recorder error) while we are still
+    // recording: note it in the timeline right away, at the time it happened.
+    if (wasActive && params.reason !== 'stopped' && this.state === 'recording') {
+      this.writeEvent({
+        type: 'narration-stopped',
+        reason: params.reason,
+        error: params.error,
+        ...this.narrationSummary(),
+      })
+    }
+  }
+
+  destroyNarration(reason: string): void {
+    this.narration?.destroy(reason)
+  }
+
+  private narrationSummary(): Record<string, unknown> {
+    const metadata = this.narration?.metadata()
+    if (!metadata) {
+      return {}
+    }
+    return {
+      audioPath: metadata.audioPath,
+      audioStartMs: metadata.audioStartMs,
+      durationMs: metadata.durationMs,
+      sizeBytes: metadata.sizeBytes,
+      mimeType: metadata.mimeType,
+    }
+  }
+
+  async stop(options?: {
+    reason?: RecordingStopReason
+  }): Promise<{ eventCount: number; filePath: string; narration: NarrationMetadata | null }> {
     if (this.state === 'stopped' || this.state === 'stopping') {
-      return { eventCount: this.eventCount, filePath: this.filePath }
+      return { eventCount: this.eventCount, filePath: this.filePath, narration: this.narrationMetadata() }
     }
     const reason = options?.reason ?? 'user'
     if (this.state === 'starting') {
@@ -667,6 +776,7 @@ export class ActionRecorder {
     // 2. Let in-flight captures finish. New captures can't be enqueued anymore.
     await this.captureChain.catch(() => {})
     await this.stopAllScreencasts()
+    const narration = await this.stopNarration()
     // 3. Finalize
     this.writeEvent({
       type: 'recording-stopped',
@@ -674,13 +784,36 @@ export class ActionRecorder {
       durationSeconds: Math.round((Date.now() - this.startedAt) / 1000),
       framesDir: this.framesDir,
       frameCount: this.frameCount,
+      narration: narration.metadata,
+      narrationError: narration.error,
     })
     this.flushPersist()
     await this.disableRecorder()
     this.state = 'stopped'
     this.onDidStop?.()
     this.onDidStop = null
-    return { eventCount: this.eventCount, filePath: this.filePath }
+    return { eventCount: this.eventCount, filePath: this.filePath, narration: narration.metadata }
+  }
+
+  private async stopNarration(): Promise<{ metadata: NarrationMetadata | null; error?: string }> {
+    if (!this.narration) {
+      return { metadata: null }
+    }
+    const wasActive = this.narration.isActive
+    const metadata = await this.narration.stop().catch((error: unknown) => {
+      this.logger.error('[record] narration stop failed:', error)
+      return null
+    })
+    if (wasActive) {
+      this.writeEvent({
+        type: 'narration-stopped',
+        reason: metadata?.endReason ?? 'error',
+        error: metadata?.error,
+        ...this.narrationSummary(),
+      })
+    }
+    const failure = this.narration.failureInfo()
+    return { metadata, error: metadata ? metadata.error : failure?.error }
   }
 
   // _enableRecorder can hang forever if a frame never gets a main world
@@ -1315,6 +1448,7 @@ export class ActionRecordingManager {
     enableTimeoutMs,
     disableTimeoutMs,
     holdAfterEnable,
+    narration,
   }: {
     context: BrowserContext
     sessionId: string
@@ -1322,6 +1456,7 @@ export class ActionRecordingManager {
     enableTimeoutMs?: number
     disableTimeoutMs?: number
     holdAfterEnable?: () => Promise<void>
+    narration?: ActionRecorderOptions['narration']
   }): Promise<ActionRecorder> {
     const existing = this.activeRecordingForSession(sessionId)
     if (existing) {
@@ -1360,6 +1495,7 @@ export class ActionRecordingManager {
         enableTimeoutMs,
         disableTimeoutMs,
         holdAfterEnable,
+        narration,
       })
       // Reserve the id before the first await so concurrent starts in this
       // process can't pick the same id or bypass the duplicate-session guard
@@ -1387,7 +1523,11 @@ export class ActionRecordingManager {
     throw new RecordingError('Could not allocate a recording id after 20 attempts', 500)
   }
 
-  async stop({ recordingId }: { recordingId?: string }): Promise<{ recordingId: string; eventCount: number; filePath: string }> {
+  async stop({
+    recordingId,
+  }: {
+    recordingId?: string
+  }): Promise<{ recordingId: string; eventCount: number; filePath: string; narration: NarrationMetadata | null }> {
     const recorder: ActionRecorder | null = (() => {
       if (recordingId) {
         return this.recordings.get(recordingId) || null
@@ -1410,6 +1550,52 @@ export class ActionRecordingManager {
     return { recordingId: recorder.recordingId, ...result }
   }
 
+  mark({ recordingId, kind, note }: { recordingId?: string; kind: string; note?: string }): { recordingId: string; eventId: number } {
+    const recorder: ActionRecorder | null = (() => {
+      if (recordingId) {
+        return this.recordings.get(recordingId) || null
+      }
+      const all = [...this.recordings.values()]
+      return all.length === 1 ? all[0] : null
+    })()
+    if (!recorder) {
+      if (!recordingId && this.recordings.size > 1) {
+        const recordings = [...this.recordings.values()].map((item) => {
+          return item.summarize()
+        })
+        const error = new RecordingError(formatAmbiguousRecordingsError(recordings), 400)
+        error.recordings = recordings
+        throw error
+      }
+      throw new RecordingError(recordingId ? `Recording ${recordingId} not found` : 'No active recording', 404)
+    }
+    return { recordingId: recorder.recordingId, eventId: recorder.mark({ kind, note }) }
+  }
+
+  /** Audio chunk from the extension for one recording's narration. */
+  handleNarrationChunk({ recordingId, dataBase64 }: { recordingId: string; dataBase64: string }): void {
+    this.recordings.get(recordingId)?.handleNarrationChunk(dataBase64)
+  }
+
+  handleNarrationEnded({
+    recordingId,
+    ...params
+  }: {
+    recordingId: string
+    reason: NarrationEndReason
+    error?: string
+    durationMs?: number
+  }): void {
+    this.recordings.get(recordingId)?.handleNarrationEnded(params)
+  }
+
+  /** Extension socket closed: keep whatever audio already arrived. */
+  destroyNarrations(reason: string): void {
+    for (const recorder of this.recordings.values()) {
+      recorder.destroyNarration(reason)
+    }
+  }
+
   list(): Array<{
     recordingId: string
     sessionId: string
@@ -1418,6 +1604,7 @@ export class ActionRecordingManager {
     filePath: string
     pageUrls: string[]
     lastUrl: string
+    narration: NarrationStartOutcome | null
   }> {
     return [...this.recordings.values()].map((r) => {
       return {
@@ -1425,6 +1612,7 @@ export class ActionRecordingManager {
         startedAt: r.startedAt,
         eventCount: r.eventCount,
         filePath: r.filePath,
+        narration: r.narrationStartOutcome(),
       }
     })
   }

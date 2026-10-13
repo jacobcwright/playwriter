@@ -93,6 +93,10 @@ export interface StartRecordingOptions {
   audioBitsPerSecond?: number
   /** Include audio from tab (default: false) */
   audio?: boolean
+  /** Mix the user's microphone into the audio track (default: false). With
+   *  `audio: true` both tab audio and microphone are mixed. Requires the
+   *  one-time microphone permission (toolbar Mic toggle or `playwriter recorder start --mic`). */
+  microphone?: boolean
   /** Path to save the video file */
   outputPath: string
   /** Relay server port (default: 19988) */
@@ -268,6 +272,7 @@ export async function startRecording(options: StartRecordingOptions): Promise<Re
     videoBitsPerSecond = 2500000,
     audioBitsPerSecond = 128000,
     audio = false,
+    microphone = false,
     outputPath,
     relayPort = 19988,
   } = options
@@ -285,6 +290,7 @@ export async function startRecording(options: StartRecordingOptions): Promise<Re
       videoBitsPerSecond,
       audioBitsPerSecond,
       audio,
+      microphone,
       outputPath: absoluteOutputPath,
     }),
   })

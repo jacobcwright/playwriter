@@ -144,6 +144,7 @@ export async function handleStartRecording(params: StartRecordingParams): Promis
       videoBitsPerSecond: params.videoBitsPerSecond ?? 2500000,
       audioBitsPerSecond: params.audioBitsPerSecond ?? 128000,
       audio: params.audio ?? false,
+      microphone: params.microphone ?? false,
     })
 
     if (!result.success) {
