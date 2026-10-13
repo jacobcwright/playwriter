@@ -73,6 +73,9 @@ if [ "$NO_BINARY" = 1 ]; then
 elif [ -f "$BINARY" ]; then
   echo "==> Bundling CLI binary $BINARY"
   install -m 755 "$BINARY" "$RESOURCES/bin/playwriter-recorder"
+  # `recorder start` prints the skill-authoring instructions from a sidecar
+  # next to the executable (see cli.ts: PLAYWRITER_PROMPT_DIR / execPath lookup)
+  install -m 644 "$(dirname "$BINARY")/recorder-prompt.md" "$RESOURCES/bin/recorder-prompt.md"
 else
   echo "==> No CLI binary at $BINARY; the app will fall back to tsx $REPO/playwriter/src/cli.ts (development mode)"
 fi
