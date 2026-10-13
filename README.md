@@ -13,6 +13,12 @@
 
 Other browser MCPs spawn a fresh Chrome — no logins, no extensions, instantly flagged by bot detectors, double the memory. Playwriter connects to **your running browser** instead. One Chrome extension, full Playwright API, everything you're already logged into.
 
+> **This fork adds microphone narration to the skill recorder.** Record a
+> workflow in your own Chrome while talking through it; an agent gets the
+> clicks, screenshots, network events and your voice on one timeline and turns
+> it into a reusable skill. Nothing is uploaded. Install, commands, output
+> files and limitations: [NARRATION.md](./NARRATION.md).
+
 ## Installation
 
 1. [**Install Extension**](https://chromewebstore.google.com/detail/playwriter/jfeammnjpkecdekppnclgkkffahnhfhe) from Chrome Web Store
@@ -198,6 +204,19 @@ playwriter stream start -s 1 --rtmp rtmp://va.pscp.tv:80/x/<stream-key>
 playwriter stream status -s 1
 playwriter stream stop -s 1
 ```
+
+## Skill recorder with narration (fork)
+
+```bash
+playwriter recorder start --mic       # actions + your microphone (off by default)
+# ...demonstrate the workflow in Chrome and talk through it...
+playwriter recorder stop              # prints the narration audio path + timing
+playwriter recorder transcribe        # optional, local-only (whisper.cpp / openai-whisper / --command)
+playwriter recorder events            # transcript lines appear inline with the actions
+```
+
+Or, with no terminal: toolbar **Mic on** (once), **Record Skill**, talk, **Stop recording**, paste the
+copied prompt to your agent. Details in [NARRATION.md](./NARRATION.md).
 
 ## MCP Setup
 

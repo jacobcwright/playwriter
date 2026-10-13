@@ -91,6 +91,50 @@ noise. The fill already has the final text.
 Role names in generated locators may be prefixes of the live accessible name.
 They still match. Verify against a live snapshot before trusting them.
 
+## Narration (microphone)
+
+If the user turned the mic on (toolbar **Mic on**, or `recorder start --mic`),
+the timeline has a `narration-started` event and `recording-stopped.narration`
+holds the audio metadata: `audioPath`, `audioStartMs` (where the audio file
+begins on the timeline), `durationMs`. A `narration-unavailable` event means
+the mic was requested but could not be used (`reason`: `permission-denied`,
+`no-microphone`, ...). The actions were still recorded.
+
+```bash
+playwriter recorder narration -r <id>      # audio path + timing metadata (+ transcript if any)
+playwriter recorder transcribe -r <id>     # local transcription (whisper.cpp / openai-whisper / --command)
+playwriter recorder events -r <id>         # transcript segments appear inline as type "narration"
+```
+
+Transcription is a separate, optional, local step. Nothing is uploaded. If no
+local speech-to-text tool is installed, `transcribe` prints the options; you
+can also transcribe the file yourself and write
+`~/.playwriter/recordings/<id>/narration.transcript.json` as
+`{ "segments": [{ "start": s, "end": s, "text": "..." }] }` (seconds relative
+to the audio file). Then `recorder events` interleaves it.
+
+Alignment: audio second `s` happened at timeline `ms = audioStartMs + s * 1000`.
+Each `narration` event already carries that `ms` (and `endMs`).
+
+**Use the narration when writing the skill.** The user explained the workflow
+while doing it. Treat what they said as the spec:
+
+- Step names and the *why* of each step come from the narration, not from
+  guessing at locators ("click the second row, the first is a header").
+- Conditions and branches ("if it asks for 2FA, ...", "sometimes this modal
+  shows up") become explicit checks in the skill.
+- Values the user calls out as examples ("I'll type Acme here, that's the
+  product name") are parameters. Things they say are always the same stay literal.
+- Mistakes they flag ("oops, wrong tab", "ignore that") mean: drop those actions.
+- Warnings and gotchas ("wait for the spinner", "don't submit twice") become
+  waits and guards.
+- Prefer the narration over an inferred intent when they disagree, and say so
+  in the SKILL.md.
+
+Read `narration` events together with the surrounding `action` events; the
+speech usually describes the action right after it. Quote short phrases from
+the narration in SKILL.md step descriptions when they explain intent.
+
 ## Frames
 
 `framesDir` on the start/stop events is a folder of jpegs
@@ -451,6 +495,7 @@ or compare locators, fix the root cause, keep working parts, re-validate.
 - Every step has a verifiable outcome
 - Demo-typed values are parameters
 - Waits reflect real timing (user remarks + event gaps)
+- Narration, when present, was transcribed locally and used for step intent, conditions, parameters, and dropped mistakes
 - Secrets are never hardcoded
 - No absolute filesystem paths in SKILL.md or helper scripts
 - Replay uses playwriter commands (inline `-e` or an imported helper script)
