@@ -26,7 +26,7 @@ import type {
   OffscreenStopNarrationResult,
 } from './offscreen-types'
 import { ensureOffscreenDocument } from './recording'
-import { logger } from './background'
+import { logger, withTimeout } from './background'
 
 export const MICROPHONE_PAGE_PATH = 'src/microphone.html'
 /** chrome.storage.local key: the user's "narrate my recordings" preference */
@@ -53,18 +53,54 @@ export function hasNarrationForRecording(recordingId: string): boolean {
   return activeNarrations.has(recordingId)
 }
 
+// The preference is cached in memory: the toolbar's Record click and the
+// post-injection toolbar sync must never wait on chrome.storage (slow under
+// load, and it can hang during profile startup on some Chrome builds).
+let micPreferenceCache: boolean | null = null
+let micPreferenceLoad: Promise<boolean> | null = null
+
 export async function getRecorderMicrophonePreference(): Promise<boolean> {
-  try {
-    const stored = await chrome.storage.local.get(RECORDER_MICROPHONE_PREF_KEY)
-    return stored[RECORDER_MICROPHONE_PREF_KEY] === true
-  } catch {
-    return false
+  if (micPreferenceCache !== null) {
+    return micPreferenceCache
   }
+  if (!micPreferenceLoad) {
+    micPreferenceLoad = withTimeout(
+      chrome.storage.local.get(RECORDER_MICROPHONE_PREF_KEY).then((stored) => {
+        return stored[RECORDER_MICROPHONE_PREF_KEY] === true
+      }),
+      2000,
+      false,
+    )
+      .then((value) => {
+        if (micPreferenceCache === null) {
+          micPreferenceCache = value
+        }
+        return micPreferenceCache
+      })
+      .catch(() => {
+        micPreferenceCache ??= false
+        return micPreferenceCache
+      })
+  }
+  return micPreferenceLoad
+}
+
+/** Synchronous read for hot paths; false until the stored value has loaded. */
+export function peekRecorderMicrophonePreference(): boolean {
+  return micPreferenceCache === true
 }
 
 export async function setRecorderMicrophonePreference(enabled: boolean): Promise<void> {
-  await chrome.storage.local.set({ [RECORDER_MICROPHONE_PREF_KEY]: enabled })
+  micPreferenceCache = enabled
+  try {
+    await chrome.storage.local.set({ [RECORDER_MICROPHONE_PREF_KEY]: enabled })
+  } catch (error) {
+    logger.debug('Could not persist microphone preference:', error)
+  }
 }
+
+// Warm the cache as soon as the service worker starts
+void getRecorderMicrophonePreference()
 
 export async function getMicrophoneState(): Promise<MicrophoneStateResult> {
   try {

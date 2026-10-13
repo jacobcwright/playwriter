@@ -57,6 +57,7 @@ import {
   cancelAllNarrations,
   getMicrophoneState,
   getRecorderMicrophonePreference,
+  peekRecorderMicrophonePreference,
   handleCancelNarration,
   handleMicrophonePermissionResult,
   handleStartNarration,
@@ -2140,9 +2141,7 @@ function syncToolbarState(tabId: number): void {
       args: [toolbarRecordingId !== null, remoteTunnel !== null],
     })
     .catch(() => {})
-  void getRecorderMicrophonePreference().then((micEnabled) => {
-    setMicStateInTab(tabId, { enabled: micEnabled, live: isNarrationActive() })
-  })
+  setMicStateInTab(tabId, { enabled: peekRecorderMicrophonePreference(), live: isNarrationActive() })
 }
 
 function setMicStateInTab(tabId: number, state: { enabled: boolean; live: boolean }): void {
@@ -3856,14 +3855,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false
     }
     toolbarStartInFlight = true
-    getRecorderMicrophonePreference()
-      .then((microphone) => {
-        return fetch(`http://${RELAY_HOST}:${RELAY_PORT}/recorder/start`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(microphone ? { microphone: true } : {}),
-        })
-      })
+    const microphone = peekRecorderMicrophonePreference()
+    fetch(`http://${RELAY_HOST}:${RELAY_PORT}/recorder/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(microphone ? { microphone: true } : {}),
+    })
       .then(async (response) => {
         const result = (await response.json().catch(() => {
           return {}
