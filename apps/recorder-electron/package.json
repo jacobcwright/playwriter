@@ -1,0 +1,16 @@
+{
+  "name": "playwriter-recorder-electron",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "main": "spike/main.mjs",
+  "scripts": {
+    "spike": "electron spike/main.mjs"
+  },
+  "dependencies": {
+    "@xmorse/playwright-core": "workspace:^"
+  },
+  "devDependencies": {
+    "electron": "^44.7.1"
+  }
+}
