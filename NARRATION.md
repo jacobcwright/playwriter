@@ -42,7 +42,24 @@ Once the setup below has been done on your computer, recording is three clicks:
 If the microphone cannot be used (blocked, unplugged, in use by another app),
 the recording still happens without audio and the toolbar tells you why.
 
-## One-time setup (someone technical)
+## Easiest setup: the macOS app
+
+`apps/mac-recorder/dist/Playwriter-Recorder-<version>.zip` (build it with
+`apps/mac-recorder/build-app.sh`) is a double-clickable app that needs no
+terminal, no Node and no Chrome developer mode. Unzip, drag to Applications,
+right-click → Open the first time (it is not notarized). It starts the relay,
+downloads its own Chrome on first run, and opens a ready page with the four
+steps above. Details and limitations: `apps/mac-recorder/README.md`.
+
+That browser is not your everyday Chrome, so you are logged out of your tools
+until you copy your logins over once (macOS, one Keychain prompt):
+
+```bash
+playwriter cookies import --from chrome --list-profiles
+playwriter cookies import --from chrome --domains github.com,notion.so
+```
+
+## Manual setup (someone technical, any Chrome)
 
 The fork is not on the Chrome Web Store, so the extension is loaded unpacked.
 
