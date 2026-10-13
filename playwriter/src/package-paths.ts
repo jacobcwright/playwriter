@@ -17,6 +17,13 @@ export function getInstalledPlaywriterPackageDir(): string {
 }
 
 export function getBundledExtensionPath(): string {
+  // Standalone binaries (bun --compile) have no package dir on disk, so the
+  // host app points at the extension explicitly.
+  const envPath = process.env.PLAYWRITER_EXTENSION_PATH
+  if (envPath && fs.existsSync(path.join(envPath, 'manifest.json'))) {
+    return envPath
+  }
+
   const packageDir = getInstalledPlaywriterPackageDir()
   const candidates = [
     path.join(packageDir, 'dist', 'extension'),
