@@ -1723,7 +1723,17 @@ cli
         }
       }
       console.log('')
-      const promptPath = path.join(__dirname, '..', 'src', 'recorder-prompt.md')
+      // Resolution order: env override, the source tree, then next to the
+      // executable (standalone binaries ship recorder-prompt.md as a sidecar).
+      const promptCandidates = [
+        process.env.PLAYWRITER_PROMPT_DIR ? path.join(process.env.PLAYWRITER_PROMPT_DIR, 'recorder-prompt.md') : '',
+        path.join(__dirname, '..', 'src', 'recorder-prompt.md'),
+        path.join(path.dirname(process.execPath), 'recorder-prompt.md'),
+      ].filter(Boolean)
+      const promptPath = promptCandidates.find((candidate) => fs.existsSync(candidate))
+      if (!promptPath) {
+        throw new Error(`recorder-prompt.md not found. Looked in: ${promptCandidates.join(', ')}`)
+      }
       console.log(fs.readFileSync(promptPath, 'utf-8'))
     } catch (error: any) {
       console.error(`Error: ${error.message}`)
@@ -2509,6 +2519,221 @@ cli.command('skill', 'Print the full playwriter usage instructions').action(() =
   const content = fs.readFileSync(skillPath, 'utf-8')
   console.log(content)
 })
+
+cli
+  .command('cookies import', 'Copy logins (cookies) from your everyday Google Chrome into the Playwriter browser')
+  .option('--from <browser>', z.string().default('chrome').describe('Source browser. Only "chrome" is supported'))
+  .option('--profile <name>', z.string().default('Default').describe('Chrome profile directory, display name or email (see --list-profiles)'))
+  .option('--domains <list>', 'Comma-separated domains to import, with subdomains (e.g. github.com,notion.so)')
+  .option('--all', 'Import every cookie in the profile. Required when --domains is not given')
+  .option('--dry-run', 'Read and decrypt, print the per-domain summary, but do not touch the browser')
+  .option('--list-profiles', 'List Chrome profiles and exit')
+  .option('--host <host>', 'Remote relay server host')
+  .option('--token <token>', 'Authentication token (or use PLAYWRITER_TOKEN env var)')
+  .option('-s, --session <id>', 'Session ID (defaults to the single active session, or creates a new one)')
+  .example('playwriter cookies import --from chrome --list-profiles')
+  .example('playwriter cookies import --from chrome --domains github.com,notion.so')
+  .example('playwriter cookies import --from chrome --profile "Profile 1" --all --dry-run')
+  .action(async (options) => {
+    const {
+      assertCookieImportSupported,
+      buildCookieChunkCode,
+      chunkCookies,
+      convertChromeCookieRows,
+      COOKIE_IMPORT_CHUNK_SIZE,
+      deriveChromeCookieKey,
+      formatDomainSummary,
+      getChromeUserDataDir,
+      listChromeProfiles,
+      parseCookieChunkResult,
+      parseDomainList,
+      readChromeCookieRows,
+      readChromeSafeStoragePassword,
+      resolveChromeProfile,
+      startCookieHandoff,
+      summarizeCookiesByDomain,
+    } = await import('./chrome-cookies.js')
+
+    const fail = (message: string): never => {
+      console.error(`Error: ${message}`)
+      process.exit(1)
+    }
+
+    if (String(options.from).toLowerCase() !== 'chrome') {
+      fail(`Unsupported source "${options.from}". Only --from chrome is supported.`)
+    }
+    try {
+      assertCookieImportSupported()
+    } catch (error: any) {
+      fail(error.message)
+    }
+
+    const userDataDir = getChromeUserDataDir()
+    const profiles = listChromeProfiles({ userDataDir })
+    if (profiles.length === 0) {
+      fail(`No Google Chrome profiles found in ${userDataDir}`)
+    }
+
+    if (options.listProfiles) {
+      console.log(`Chrome profiles in ${userDataDir}:\n`)
+      for (const profile of profiles) {
+        const label = [profile.name, profile.email].filter(Boolean).join(' <') + (profile.email ? '>' : '')
+        const cookieNote = profile.cookiesPath ? '' : pc.dim('  (no Cookies file)')
+        console.log(`  ${profile.dir.padEnd(12)} ${label}${cookieNote}`)
+      }
+      console.log('\nUse --profile <dir, name or email> to pick one (default: Default).')
+      return
+    }
+
+    const profile = resolveChromeProfile({ profiles, profile: String(options.profile) })
+    if (!profile) {
+      fail(`Chrome profile "${options.profile}" not found. Run \`playwriter cookies import --list-profiles\` to see them.`)
+    }
+    if (!profile!.cookiesPath) {
+      fail(`Chrome profile "${profile!.dir}" has no Cookies database.`)
+    }
+
+    const domains = parseDomainList(options.domains)
+    const profileLabel = [profile!.dir, profile!.email].filter(Boolean).join(' / ')
+
+    let rows: Awaited<ReturnType<typeof readChromeCookieRows>> = []
+    try {
+      rows = await readChromeCookieRows({ cookiesPath: profile!.cookiesPath! })
+    } catch (error: any) {
+      fail(error.message)
+    }
+
+    // Counting needs no decryption, so the user can see what a profile holds
+    // before any Keychain prompt and without passing --all by accident.
+    if (domains.length === 0 && !options.all) {
+      const counted = convertChromeCookieRows({ rows, key: null })
+      const summary = summarizeCookiesByDomain(counted.cookies)
+      console.log(`Chrome profile ${profileLabel} has ${counted.cookies.length} unexpired cookies across ${summary.length} domains:\n`)
+      console.log(formatDomainSummary(summary))
+      console.log('')
+      console.log('Pick what to import with --domains a.com,b.com (subdomains included), or pass --all to import everything.')
+      process.exit(1)
+    }
+
+    console.error(
+      'Reading the Chrome encryption key from your macOS Keychain. macOS will ask you to allow "security" to access "Chrome Safe Storage" (once; choose "Always Allow" to skip it next time).',
+    )
+    let key: Buffer
+    try {
+      const password = await readChromeSafeStoragePassword()
+      key = deriveChromeCookieKey({ password })
+    } catch (error: any) {
+      fail(error.message)
+    }
+
+    const converted = convertChromeCookieRows({ rows, key: key!, domains })
+    const summary = summarizeCookiesByDomain(converted.cookies)
+    const notes: string[] = []
+    if (converted.expired) notes.push(`${converted.expired} expired`)
+    if (converted.filteredOut) notes.push(`${converted.filteredOut} outside --domains`)
+    if (converted.undecryptable) notes.push(`${converted.undecryptable} could not be decrypted`)
+    const skippedNote = notes.length ? ` (skipped: ${notes.join(', ')})` : ''
+
+    if (converted.cookies.length === 0) {
+      const hint =
+        converted.undecryptable > 0
+          ? ' Decryption failed for every cookie: the Keychain key may belong to a different Chrome install.'
+          : domains.length
+            ? ` No unexpired cookies match --domains ${domains.join(',')}.`
+            : ''
+      fail(`Nothing to import from Chrome profile ${profileLabel}${skippedNote}.${hint}`)
+    }
+
+    console.log(`${options.dryRun ? 'Would import' : 'Importing'} ${converted.cookies.length} cookies from Chrome profile ${profileLabel}${skippedNote}:\n`)
+    console.log(formatDomainSummary(summary))
+    console.log('')
+    if (options.dryRun) {
+      console.log('Dry run: nothing was sent to the browser.')
+      return
+    }
+
+    if (!options.host && !process.env.PLAYWRITER_HOST) {
+      await ensureRelayServer({ logger: console })
+    }
+    const serverUrl = await getServerUrl(options.host)
+    const headers = buildAuthHeaders({ token: options.token, json: true })
+
+    const sessionId: string = await (async () => {
+      const explicit = options.session ? String(options.session) : process.env.PLAYWRITER_SESSION
+      if (explicit) {
+        return explicit
+      }
+      const listResponse = await fetch(`${serverUrl}/cli/sessions`, {
+        headers: buildAuthHeaders({ token: options.token }),
+        signal: AbortSignal.timeout(5000),
+      }).catch(() => null)
+      if (!listResponse) {
+        return fail('Cannot connect to the relay server. Start the Playwriter browser first (`playwriter browser start`).')
+      }
+      const { sessions } = (await listResponse.json()) as { sessions: Array<{ id: string }> }
+      if (sessions.length === 1) {
+        return sessions[0].id
+      }
+      if (sessions.length > 1) {
+        return fail(`Multiple sessions active (${sessions.map((s) => s.id).join(', ')}). Pass -s <id>.`)
+      }
+      const newResponse = await fetch(`${serverUrl}/cli/session/new`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ cwd: process.cwd(), cloudAuth: getRelayCloudAuth() }),
+      })
+      const newResult = (await newResponse.json()) as { id?: string; error?: string }
+      if (!newResponse.ok || !newResult.id) {
+        return fail(`Could not create a session: ${newResult.error || newResponse.status}. Run 'playwriter session new' first, then retry with -s <id>.`)
+      }
+      return newResult.id
+    })()
+
+    // Cookie values are handed to the relay through a one-shot loopback server
+    // rather than inlined in the executed code, because the relay logs that
+    // code to its log file. See startCookieHandoff in chrome-cookies.ts.
+    const chunks = chunkCookies(converted.cookies, COOKIE_IMPORT_CHUNK_SIZE)
+    const handoff = await startCookieHandoff({ chunks })
+    const imported: Array<{ domain: string }> = []
+    const failed: Array<{ name: string; domain: string }> = []
+    try {
+      for (const [index, chunk] of chunks.entries()) {
+        const code = buildCookieChunkCode({ chunkUrl: `${handoff.baseUrl}/${index}` })
+        const timeout = 60_000
+        const response = await undiciFetch(`${serverUrl}/cli/execute`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ sessionId, code, timeout, cwd: process.cwd() }),
+          dispatcher: executeDispatcher,
+          signal: AbortSignal.timeout(timeout + 30_000),
+        })
+        const result = (await response.json().catch(() => null)) as { text?: string; isError?: boolean } | null
+        if (!response.ok || !result || result.isError) {
+          fail(`Browser rejected cookie batch ${index + 1}/${chunks.length}: ${result?.text || response.status}`)
+        }
+        const parsed = parseCookieChunkResult(result!.text || '')
+        if (!parsed) {
+          fail(`Unexpected relay output for cookie batch ${index + 1}/${chunks.length}: ${result!.text}`)
+        }
+        failed.push(...parsed!.failed)
+        const failedKeys = new Set(parsed!.failed.map((f) => `${f.domain}\u0000${f.name}`))
+        imported.push(...chunk.filter((cookie) => !failedKeys.has(`${cookie.domain}\u0000${cookie.name}`)))
+      }
+    } catch (error: any) {
+      if (error.cause?.code === 'ECONNREFUSED') {
+        fail(`Cannot connect to relay server. Check logs at ${LOG_FILE_PATH}`)
+      }
+      fail(error.message)
+    } finally {
+      await handoff.close()
+    }
+
+    console.log(`Imported ${imported.length} cookies into session ${sessionId}${failed.length ? `, ${failed.length} rejected by the browser` : ''}.`)
+    if (failed.length) {
+      console.log(pc.dim(`Rejected: ${failed.slice(0, 10).map((f) => `${f.name}@${f.domain}`).join(', ')}${failed.length > 10 ? ', ...' : ''}`))
+    }
+    console.log('Pages in that session are now logged in where Chrome was. Local storage, IndexedDB and passkeys are not copied.')
+  })
 
 cli.help()
 cli.completions()
