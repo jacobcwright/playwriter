@@ -70,6 +70,7 @@ export default defineConfig({
         offscreen: resolve(__dirname, 'src/offscreen.html'),
         welcome: resolve(__dirname, 'src/welcome.html'),
         tutorial: resolve(__dirname, 'src/tutorial.html'),
+        microphone: resolve(__dirname, 'src/microphone.html'),
       },
       output: {
         entryFileNames: '[name].js',

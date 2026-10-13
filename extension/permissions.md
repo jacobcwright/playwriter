@@ -59,6 +59,19 @@ Creates a hidden extension document for `MediaRecorder` and user-requested
 clipboard writes. Service workers cannot own media streams or use the document
 clipboard APIs directly.
 
+### Microphone (runtime permission, no manifest entry)
+
+Skill recordings can include the user's spoken narration. The microphone is
+not a manifest permission: Chrome asks the user through its standard
+`getUserMedia` prompt, shown on the extension's own visible page
+(`src/microphone.html`) the first time the user turns the toolbar **Mic**
+toggle on. Narration is off by default. Capture runs only while a skill
+recording the user started is active, the toolbar shows **Mic live** and the
+action badge shows **MIC** the whole time, and the stream is stopped the moment
+the recording ends. Audio chunks go to the local relay only and are written to
+`~/.playwriter/recordings/<id>/narration.webm`. Narration is refused over
+Remote control.
+
 ### clipboardWrite
 
 Copies prompts after trusted user actions such as **Remote control**, **Record
