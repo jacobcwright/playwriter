@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Playwriter Recorder</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #fafafa;
+      --fg: #1a1a1a;
+      --muted: #666;
+      --card: #fff;
+      --line: #e3e3e3;
+      --accent: #16a34a;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #161616; --fg: #ededed; --muted: #9a9a9a; --card: #202020; --line: #333; --accent: #22c55e; }
+    }
+    html, body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif; }
+    main { max-width: 640px; margin: 0 auto; padding: 48px 16px 64px; }
+    h1 { font-size: 28px; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin: 0 0 32px; }
+    ol { padding-left: 0; list-style: none; counter-reset: step; margin: 0 0 32px; }
+    ol li { counter-increment: step; display: flex; gap: 16px; padding: 16px 0; border-top: 1px solid var(--line); }
+    ol li::before { content: counter(step); flex: 0 0 32px; height: 32px; border-radius: 16px; background: var(--accent); color: #fff; font-weight: 600; display: flex; align-items: center; justify-content: center; }
+    ol li:last-child { border-bottom: 1px solid var(--line); }
+    b { font-weight: 600; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 20px; margin-bottom: 16px; }
+    .card h2 { font-size: 15px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+    code { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: color-mix(in srgb, var(--fg) 7%, transparent); padding: 1px 6px; border-radius: 4px; }
+    p { margin: 0 0 8px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Playwriter Recorder is ready</h1>
+    <p class="sub">Leave this tab open. Record on any other tab in this window.</p>
+
+    <ol>
+      <li><div><b>Open the page where the workflow starts</b> in a new tab, then click the <b>Playwriter icon</b> in the toolbar (top right, next to the address bar) so it turns green. A small Playwriter bar appears on the page.</div></li>
+      <li><div><b>Turn the microphone on.</b> On the bar, click <b>Mic off</b> so it reads <b>Mic on</b>. The first time, a tab opens with one button, <b>Allow microphone</b>: click it and accept the prompts from Chrome and from macOS. This is remembered.</div></li>
+      <li><div><b>Click Record Skill and talk.</b> Do the workflow and say what you are doing and why, like explaining it to a colleague. Mistakes are fine: say "ignore that" and keep going.</div></li>
+      <li><div><b>Click Stop recording.</b> The microphone turns off and a message for your AI agent is copied to the clipboard. Paste it into the agent's chat.</div></li>
+    </ol>
+
+    <div class="card">
+      <h2>Where recordings go</h2>
+      <p>Everything stays on this Mac, in your home folder under <code>.playwriter/recordings</code>. Each recording has a timeline (<code>&lt;id&gt;.json</code>), screenshots and the microphone audio (<code>narration.webm</code>).</p>
+      <p>The folder is hidden in Finder: press <b>Cmd + Shift + G</b> and paste <code>~/.playwriter/recordings</code>.</p>
+    </div>
+
+    <div class="card">
+      <h2>Good to know</h2>
+      <p>This browser is separate from your everyday Chrome. Sign in to the sites you need once; logins are kept between runs.</p>
+      <p>If the bar says <b>Relay not connected</b>, quit this browser and open Playwriter Recorder again.</p>
+    </div>
+  </main>
+</body>
+</html>
