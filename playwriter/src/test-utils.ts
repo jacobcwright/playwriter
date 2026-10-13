@@ -106,7 +106,14 @@ export async function setupTestContext({
     channel: 'chromium',
     headless: !process.env.HEADFUL,
     colorScheme: 'dark',
-    args: [`--disable-extensions-except=${allExtensionPaths}`, `--load-extension=${allExtensionPaths}`],
+    args: [
+      `--disable-extensions-except=${allExtensionPaths}`,
+      `--load-extension=${allExtensionPaths}`,
+      // Fake microphone + auto-accepted permission prompt so narration tests
+      // can exercise the real getUserMedia/MediaRecorder path headlessly
+      '--use-fake-device-for-media-stream',
+      '--use-fake-ui-for-media-stream',
+    ],
   })
 
   const serviceWorker = await getExtensionServiceWorker(browserContext)
