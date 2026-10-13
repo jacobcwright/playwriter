@@ -32,9 +32,12 @@ Once the setup below has been done on your computer, recording is three clicks:
    the extension icon shows a red **MIC** badge. Do the workflow and say what
    you are doing and why, as if explaining it to a colleague. Mistakes and
    pauses are fine; say "ignore that" and keep going.
-4. Click **Stop recording**. The microphone turns off immediately and a
-   message for your AI agent is copied to the clipboard. Paste it into the
-   agent's chat. Done.
+4. Made a mistake? Click **Oops**, then redo the step. The agent will skip
+   the wrong attempt. The Stop button shows how long you have been recording.
+5. Click **Stop recording**. The microphone turns off immediately, a short
+   summary appears ("Recorded: 23 events, voice saved"), and a message for
+   your AI agent is copied to the clipboard. Paste it into the agent's chat.
+   Done.
 
 If the microphone cannot be used (blocked, unplugged, in use by another app),
 the recording still happens without audio and the toolbar tells you why.
@@ -135,6 +138,7 @@ Events added to the timeline:
 | `narration-unavailable` | mic was requested but could not be used: `reason` (`permission-denied`, `permission-pending`, `no-microphone`, `capture-failed`, `unsupported`) and `error` |
 | `narration-stopped` | mic released: `reason` (`stopped`, `device-lost`, `cancelled`, `error`), duration, size |
 | `narration` | one transcript segment (`text`, `ms`, `endMs`); only once a transcript exists |
+| `marker` | the user pressed **Oops** (`kind: "mistake"`, optional `note`): the actions just before it were a mistake they redid. Also `POST /recorder/mark` |
 
 `recording-stopped.narration` repeats the full metadata so an agent reading
 the end of the timeline has everything.

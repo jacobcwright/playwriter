@@ -2239,7 +2239,8 @@ export async function startPlayWriterCDPRelayServer({
     // Websites still cannot call these: CORS only allows our extension origin,
     // so a page preflight fails and the POST is never sent.
     const secFetchSite = c.req.header('sec-fetch-site')
-    const isRecorderToggle = c.req.path === '/recorder/start' || c.req.path === '/recorder/stop'
+    const isRecorderToggle =
+      c.req.path === '/recorder/start' || c.req.path === '/recorder/stop' || c.req.path === '/recorder/mark'
     if (!isRecorderToggle && secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
       logger?.log(pc.red(`Rejecting ${c.req.path}: cross-origin browser request (Sec-Fetch-Site: ${secFetchSite})`))
       return c.text('Forbidden - Cross-origin requests not allowed', 403)
@@ -3079,6 +3080,25 @@ export async function startPlayWriterCDPRelayServer({
         recordings ? { error: error.message, recordings } : { error: error.message },
         recordingErrorStatus(error),
       )
+    }
+  })
+
+  // Marker in the timeline (toolbar Oops button): kind 'mistake' means "what I
+  // just did was wrong, I'm redoing it"; agents drop the actions before it.
+  app.post('/recorder/mark', async (c) => {
+    try {
+      const body: { recordingId?: string | number; kind?: string; note?: string } = await c.req.json().catch(() => ({}))
+      const kind = typeof body.kind === 'string' && /^[a-z-]{1,32}$/.test(body.kind) ? body.kind : 'mistake'
+      const recordingManager = await getActionRecordingManager()
+      const result = recordingManager.mark({
+        recordingId: normalizeSessionId(body.recordingId) || undefined,
+        kind,
+        note: typeof body.note === 'string' ? body.note : undefined,
+      })
+      return c.json(result)
+    } catch (error: any) {
+      const recordings = (error as { recordings?: unknown }).recordings
+      return c.json(recordings ? { error: error.message, recordings } : { error: error.message }, recordingErrorStatus(error))
     }
   })
 

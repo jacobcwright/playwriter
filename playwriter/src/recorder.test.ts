@@ -626,6 +626,48 @@ describe('action recording', () => {
     await htmlServer.close()
   }, 120000)
 
+  it('writes a marker event when the user presses Oops, only while recording', async () => {
+    const browserContext = testCtx!.browserContext
+    const serviceWorker = await getExtensionServiceWorker(browserContext)
+    const page = await browserContext.newPage()
+    await page.goto('https://example.com/?marker')
+    await page.bringToFront()
+    await serviceWorker.evaluate(async () => {
+      await globalThis.toggleExtensionForActiveTab()
+    })
+    await new Promise((r) => setTimeout(r, 200))
+    const session = (await (
+      await fetch(`${SERVER_URL}/cli/session/new`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({}) })
+    ).json()) as { id: string }
+
+    // no active recording -> 404
+    const noneResponse = await fetch(`${SERVER_URL}/recorder/mark`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({}) })
+    expect(noneResponse.status).toBe(404)
+
+    const start = (await (
+      await fetch(`${SERVER_URL}/recorder/start`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ sessionId: session.id }) })
+    ).json()) as { recordingId: string }
+    const markResponse = await fetch(`${SERVER_URL}/recorder/mark`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ recordingId: start.recordingId, kind: 'mistake', note: 'wrong tab' }),
+    })
+    expect(markResponse.status).toBe(200)
+    const mark = (await markResponse.json()) as { recordingId: string; eventId: number }
+    expect(mark.recordingId).toBe(start.recordingId)
+    // unknown kinds fall back to mistake instead of polluting the timeline
+    await fetch(`${SERVER_URL}/recorder/mark`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ kind: 'DROP TABLE' }) })
+    const stop = (await (
+      await fetch(`${SERVER_URL}/recorder/stop`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ recordingId: start.recordingId }) })
+    ).json()) as { filePath: string }
+    const markers = parseRecording(fs.readFileSync(stop.filePath, 'utf-8')).filter((e) => e.type === 'marker')
+    expect(markers.map((e) => [e.id, e.kind, e.note])).toEqual([
+      [mark.eventId, 'mistake', 'wrong tab'],
+      [mark.eventId + 1, 'mistake', undefined],
+    ])
+    await deleteSession(session.id)
+  }, 60000)
+
   // Chrome runs with a fake microphone and auto-accepted prompts (test-utils),
   // so this drives the real path: permission check -> offscreen getUserMedia ->
   // MediaRecorder -> chunks over the extension socket -> file on disk.

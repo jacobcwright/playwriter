@@ -976,10 +976,29 @@ export function initPlaywriterToolbar(): void {
   const recordBtn = document.createElement('button')
   recordBtn.className = 'record-btn'
 
+  // Elapsed time on the Stop button: non-technical users need to see that
+  // the recorder is alive. Starts counting when the relay confirms the start.
+  let recordingStartedAt = 0
+  let recordTimer: number | null = null
+
+  function formatElapsed(): string {
+    const total = Math.max(0, Math.floor((Date.now() - recordingStartedAt) / 1000))
+    const minutes = Math.floor(total / 60)
+    const seconds = total % 60
+    return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`
+  }
+
+  function stopRecordTimer(): void {
+    if (recordTimer !== null) {
+      window.clearInterval(recordTimer)
+      recordTimer = null
+    }
+  }
+
   function updateRecordBtn(): void {
     recordBtn.classList.remove('active', 'loading')
     if (isRecording) {
-      recordBtn.innerHTML = STOP_SVG + ' <span>Stop recording\u2026</span>'
+      recordBtn.innerHTML = STOP_SVG + ' <span>Stop \u00b7 ' + formatElapsed() + '</span>'
       recordBtn.setAttribute('data-tooltip', 'Stop recording')
       recordBtn.classList.add('active')
       return
@@ -1001,8 +1020,18 @@ export function initPlaywriterToolbar(): void {
       isRecording = recording
       if (recording) {
         setPinMode(false)
+        recordingStartedAt = Date.now()
+        stopRecordTimer()
+        recordTimer = window.setInterval(() => {
+          if (isRecording) {
+            updateRecordBtn()
+          }
+        }, 1000)
+      } else {
+        stopRecordTimer()
       }
     }
+    oopsBtn.style.display = recording ? '' : 'none'
     updateRecordBtn()
     if (recording && pendingStop) {
       pendingStop = false
@@ -1036,6 +1065,22 @@ export function initPlaywriterToolbar(): void {
     startInFlight = true
     updateRecordBtn()
     window.__playwriterToolbarStartRecording()
+  })
+
+  // Oops: visible only while recording. Marks "what I just did was wrong, I'm
+  // redoing it" in the timeline so the agent drops those actions.
+  const oopsBtn = document.createElement('button')
+  oopsBtn.className = 'record-btn oops-btn'
+  oopsBtn.innerHTML = '<span>Oops</span>'
+  oopsBtn.setAttribute('data-tooltip', 'Mark the last step as a mistake')
+  oopsBtn.style.display = 'none'
+  oopsBtn.addEventListener('click', (e: MouseEvent) => {
+    e.stopPropagation()
+    if (!isTrustedToolbarClick(e) || !isRecording) {
+      return
+    }
+    playSound('click')
+    void chrome.runtime.sendMessage({ action: 'actionRecorderMark' })
   })
 
   // Mic toggle: off by default. Click to remember "narrate my recordings".
@@ -1399,6 +1444,7 @@ export function initPlaywriterToolbar(): void {
     toolbarEl.appendChild(pinBtn)
     toolbarEl.appendChild(sep1)
     toolbarEl.appendChild(recordBtn)
+    toolbarEl.appendChild(oopsBtn)
     toolbarEl.appendChild(micBtn)
     toolbarEl.appendChild(sep2)
     toolbarEl.appendChild(remoteBtn)
@@ -1459,6 +1505,7 @@ export function initPlaywriterToolbar(): void {
 
   window.__playwriterToolbarDestroy = function (): void {
     setPinMode(false)
+    stopRecordTimer()
     hideRemotePanels()
     document.removeEventListener('mousedown', onDocMouseDown, true)
     document.removeEventListener('keydown', onRemoteKeyDown, true)

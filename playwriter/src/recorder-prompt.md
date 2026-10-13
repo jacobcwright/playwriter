@@ -91,6 +91,14 @@ noise. The fill already has the final text.
 Role names in generated locators may be prefixes of the live accessible name.
 They still match. Verify against a live snapshot before trusting them.
 
+## Markers (the Oops button)
+
+A `marker` event with `kind: "mistake"` means the user pressed **Oops** on the
+toolbar: what they did just before it was wrong and they redid it right after.
+Drop the actions between the previous successful step and the marker (use
+frames and narration to find where the wrong attempt started; it is usually
+the last one to three actions). Keep the actions after the marker.
+
 ## Narration (microphone)
 
 If the user turned the mic on (toolbar **Mic on**, or `recorder start --mic`),

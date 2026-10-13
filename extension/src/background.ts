@@ -3902,6 +3902,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false
   }
 
+  // Oops button: mark a mistake in the active recording's timeline.
+  if (message.action === 'actionRecorderMark') {
+    const senderTabId = sender.tab?.id
+    if (!senderTabId || sender.frameId !== 0 || store.getState().tabs.get(senderTabId)?.state !== 'connected') {
+      return false
+    }
+    fetch(`http://${RELAY_HOST}:${RELAY_PORT}/recorder/mark`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...(toolbarRecordingId ? { recordingId: toolbarRecordingId } : {}), kind: 'mistake' }),
+    })
+      .then(async (response) => {
+        if (response.ok) {
+          toastToolbar(senderTabId, 'Marked. Redo that step')
+          return
+        }
+        const result = (await response.json().catch(() => ({}))) as { error?: string }
+        toastToolbar(senderTabId, result.error || 'Could not mark')
+      })
+      .catch(() => {
+        toastToolbar(senderTabId, 'Could not mark')
+      })
+    return false
+  }
+
   if (message.action === 'actionRecorderStop') {
     const senderTabId = sender.tab?.id
     if (!senderTabId || sender.frameId !== 0 || store.getState().tabs.get(senderTabId)?.state !== 'connected') {
@@ -3913,7 +3938,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       body: JSON.stringify(toolbarRecordingId ? { recordingId: toolbarRecordingId } : {}),
     })
       .then((r) => r.json())
-      .then(async (result: { recordingId?: string; error?: string }) => {
+      .then(
+        async (result: {
+          recordingId?: string
+          error?: string
+          eventCount?: number
+          narration?: { durationMs?: number; endReason?: string } | null
+        }) => {
         if (!result.recordingId) {
           logger.error('Action recorder stop failed:', result.error || 'unknown')
           if (senderTabId) {
@@ -3946,15 +3977,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             : []),
         ].join('\n')
         setRecorderStateInTab(senderTabId, false)
+        // Summary first so the user knows it worked, then the paste hint.
+        const actions = typeof result.eventCount === 'number' ? `${result.eventCount} events` : 'saved'
+        const mic = result.narration
+          ? result.narration.endReason === 'stopped'
+            ? ', voice saved'
+            : ', voice cut short'
+          : ''
         try {
           await copyTextInOffscreenDocument(prompt)
-          toastToolbar(senderTabId, 'Copied prompt')
+          toastToolbar(senderTabId, `Recorded: ${actions}${mic}. Prompt copied, paste it to your agent`)
           playToolbarSound(senderTabId, 'success')
         } catch (error) {
           logger.error('Could not copy recorder prompt:', error)
-          toastToolbar(senderTabId, `Copy failed. Run: playwriter recorder events -r ${result.recordingId}`)
+          toastToolbar(senderTabId, `Recorded: ${actions}${mic}. Run: playwriter recorder events -r ${result.recordingId}`)
         }
-      })
+      },
+      )
       .catch((err) => {
         logger.error('Action recorder stop failed:', err)
       })

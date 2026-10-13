@@ -701,6 +701,15 @@ export class ActionRecorder {
     })
   }
 
+  /** User-placed marker (toolbar Oops button, or `recorder mark`). Written at
+   *  the time it arrives so it sits between the right actions. */
+  mark({ kind, note }: { kind: string; note?: string }): number {
+    if (this.state !== 'recording') {
+      throw new RecordingError('Recording is not active', 409)
+    }
+    return this.writeEvent({ type: 'marker', kind, note: note ? truncate(note, 500) : undefined })
+  }
+
   narrationStartOutcome(): NarrationStartOutcome | null {
     return this.narrationOutcome
   }
@@ -1539,6 +1548,28 @@ export class ActionRecordingManager {
     }
     const result = await recorder.stop()
     return { recordingId: recorder.recordingId, ...result }
+  }
+
+  mark({ recordingId, kind, note }: { recordingId?: string; kind: string; note?: string }): { recordingId: string; eventId: number } {
+    const recorder: ActionRecorder | null = (() => {
+      if (recordingId) {
+        return this.recordings.get(recordingId) || null
+      }
+      const all = [...this.recordings.values()]
+      return all.length === 1 ? all[0] : null
+    })()
+    if (!recorder) {
+      if (!recordingId && this.recordings.size > 1) {
+        const recordings = [...this.recordings.values()].map((item) => {
+          return item.summarize()
+        })
+        const error = new RecordingError(formatAmbiguousRecordingsError(recordings), 400)
+        error.recordings = recordings
+        throw error
+      }
+      throw new RecordingError(recordingId ? `Recording ${recordingId} not found` : 'No active recording', 404)
+    }
+    return { recordingId: recorder.recordingId, eventId: recorder.mark({ kind, note }) }
   }
 
   /** Audio chunk from the extension for one recording's narration. */
